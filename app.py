@@ -308,7 +308,7 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers):
 
     monthly_stats = []
     for month_key in sorted(monthly_groups.keys()):
-        group = monthly_groups[month_key]
+        group = monthly_groups[key := month_key]
         avg_kwh = group["total_kwh"] / group["days"]
         avg_cost = (group["total_cost"] / group["days"]) if group["total_cost"] else None
         monthly_stats.append({
@@ -327,8 +327,38 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers):
 
 # ---------- ROUTES ----------
 
-@app.route("/", methods=["GET", "POST"])
+@app.route("/")
 def index():
+    """Dashboard / visualization only."""
+    ensure_data_files()
+
+    readings = load_readings()
+    tariffs = load_tariffs()
+    offsets = load_offsets()
+    grid_powers = load_grid_power()
+    stats = compute_stats(readings, tariffs, offsets, grid_powers)
+
+    daily_entries = stats["daily_entries"][-60:]
+    daily_labels = [e["date"].isoformat() for e in daily_entries]
+    daily_values = [round(e["daily_kwh"], 2) for e in daily_entries]
+
+    monthly_labels = [m["month"] for m in stats["monthly_stats"]]
+    monthly_values = [round(m["avg_kwh_per_day"], 2) for m in stats["monthly_stats"]]
+
+    return render_template(
+        "index.html",
+        readings=readings[-20:],
+        stats=stats,
+        daily_labels=daily_labels,
+        daily_values=daily_values,
+        monthly_labels=monthly_labels,
+        monthly_values=monthly_values,
+    )
+
+
+@app.route("/input", methods=["GET", "POST"])
+def input_view():
+    """Data entry: readings + offsets."""
     ensure_data_files()
 
     if request.method == "POST":
@@ -350,32 +380,18 @@ def index():
             except Exception as e:
                 flash(f"Could not save offset: {e}", "danger")
 
-        return redirect(url_for("index"))
+        return redirect(url_for("input_view"))
 
     readings = load_readings()
-    tariffs = load_tariffs()
     offsets = load_offsets()
     grid_powers = load_grid_power()
-    stats = compute_stats(readings, tariffs, offsets, grid_powers)
-
-    daily_entries = stats["daily_entries"][-60:]
-    daily_labels = [e["date"].isoformat() for e in daily_entries]
-    daily_values = [round(e["daily_kwh"], 2) for e in daily_entries]
-
-    monthly_labels = [m["month"] for m in stats["monthly_stats"]]
-    monthly_values = [round(m["avg_kwh_per_day"], 2) for m in stats["monthly_stats"]]
 
     return render_template(
-        "index.html",
-        readings=readings[-20:],
-        stats=stats,
-        today=date.today().isoformat(),
-        daily_labels=daily_labels,
-        daily_values=daily_values,
-        monthly_labels=monthly_labels,
-        monthly_values=monthly_values,
+        "input.html",
+        readings=readings[-10:],  # small helper table
         offsets=offsets,
         grid_powers=grid_powers,
+        today=date.today().isoformat(),
     )
 
 
@@ -426,6 +442,7 @@ def tariffs():
         today=date.today().isoformat(),
     )
 
+
 if __name__ == "__main__":
-    # In Docker: bind to all interfaces, disable debug to avoid extra restrictions
+    # Docker-compatible
     app.run(host="0.0.0.0", port=5000, debug=False)

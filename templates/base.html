@@ -132,7 +132,7 @@
 
     .chart-wrapper {
       position: relative;
-      height: 240px;   /* fixed height to prevent infinite expand */
+      height: 240px;
     }
   </style>
 
@@ -145,6 +145,9 @@
   <nav>
     <a href="{{ url_for('index') }}" class="{% if request.endpoint == 'index' %}active{% endif %}">
       Dashboard
+    </a>
+    <a href="{{ url_for('input_view') }}" class="{% if request.endpoint == 'input_view' %}active{% endif %}">
+      Input
     </a>
     <a href="{{ url_for('tariffs') }}" class="{% if request.endpoint == 'tariffs' %}active{% endif %}">
       Tariffs
