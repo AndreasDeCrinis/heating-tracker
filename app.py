@@ -1,13 +1,19 @@
 import csv
 import calendar
+import logging
 from pathlib import Path
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
+import threading
 
+import requests
 from flask import Flask, render_template, request, redirect, url_for, flash
 import pandas as pd
 
 app = Flask(__name__)
 app.secret_key = "change-this-secret-key"
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -15,8 +21,16 @@ READINGS_CSV = DATA_DIR / "readings.csv"
 TARIFFS_CSV = DATA_DIR / "tariffs.csv"
 OFFSETS_CSV = DATA_DIR / "offsets.csv"
 GRID_POWER_CSV = DATA_DIR / "grid_power.csv"
+WEATHER_CSV = DATA_DIR / "weather.csv"
 
 CSV_DATE_FORMAT = "%d.%m.%Y"  # e.g. 01.01.2022
+
+# Weather / HDD settings
+WEATHER_CITY = "Arnfels"
+WEATHER_LAT = 46.6764
+WEATHER_LON = 15.4031
+HDD_BASE_TEMP_C = 18.0
+WEATHER_UPDATE_INTERVAL_SECONDS = 24 * 60 * 60  # once per day
 
 
 # ---------- DATE HELPERS ----------
@@ -70,6 +84,11 @@ def ensure_data_files():
         with GRID_POWER_CSV.open("w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["date", "power_kw"])
+
+    if not WEATHER_CSV.exists():
+        with WEATHER_CSV.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["date", "avg_temp_c"])
 
 
 # ---------- GENERIC SIMPLE CSV LOADERS (HANDLE ; OR ,) ----------
@@ -183,6 +202,246 @@ def append_grid_power(date_str, power_str):
         writer.writerow([format_csv_date(dt), power_kw])
 
 
+# ---------- WEATHER HISTORY ----------
+
+def load_weather_history():
+    """Load weather.csv -> dict[date -> avg_temp_c]."""
+    if not WEATHER_CSV.exists():
+        return {}
+    history = {}
+    with WEATHER_CSV.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                d = datetime.strptime(row["date"], "%Y-%m-%d").date()
+                t = float(row["avg_temp_c"])
+                history[d] = t
+            except Exception:
+                continue
+    return history
+
+
+def save_weather_history(history: dict):
+    with WEATHER_CSV.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["date", "avg_temp_c"])
+        for d in sorted(history.keys()):
+            writer.writerow([d.isoformat(), history[d]])
+
+
+def fetch_historical_weather(start_date: date, end_date: date) -> dict:
+    """
+    Fetch historical daily mean temperature from Open-Meteo
+    for Arnfels between start_date and end_date (inclusive).
+    Returns dict[date -> avg_temp_c].
+    """
+    logger.info(f"Fetching historical weather {start_date}..{end_date} for {WEATHER_CITY}")
+    url = "https://archive-api.open-meteo.com/v1/archive"
+    params = {
+        "latitude": WEATHER_LAT,
+        "longitude": WEATHER_LON,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "daily": "temperature_2m_mean",
+        "timezone": "auto",
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        times = data.get("daily", {}).get("time", [])
+        temps = data.get("daily", {}).get("temperature_2m_mean", [])
+        result = {}
+        for t_str, temp in zip(times, temps):
+            try:
+                d = datetime.strptime(t_str, "%Y-%m-%d").date()
+                result[d] = float(temp)
+            except Exception:
+                continue
+        logger.info(f"Fetched {len(result)} historical days")
+        return result
+    except Exception as e:
+        logger.warning(f"Failed to fetch historical weather: {e}")
+        return {}
+
+
+def daterange(start: date, end: date):
+    """Yield dates from start to end (inclusive)."""
+    cur = start
+    while cur <= end:
+        yield cur
+        cur += timedelta(days=1)
+
+
+def update_weather_history_if_needed():
+    """
+    Ensure weather.csv has daily average temperature for all dates
+    between the earliest reading date and today.
+    """
+    readings = load_readings()
+    if not readings:
+        return
+
+    history = load_weather_history()
+    have_dates = set(history.keys())
+
+    earliest = min(r["date"] for r in readings)
+    today = date.today()
+    if earliest > today:
+        return
+
+    missing_ranges = []
+    current_start = None
+    current_end = None
+
+    for d in daterange(earliest, today):
+        if d not in have_dates:
+            if current_start is None:
+                current_start = d
+                current_end = d
+            else:
+                current_end = d
+        else:
+            if current_start is not None:
+                missing_ranges.append((current_start, current_end))
+                current_start = None
+                current_end = None
+    if current_start is not None:
+        missing_ranges.append((current_start, current_end))
+
+    if not missing_ranges:
+        logger.info("Weather history up to date.")
+        return
+
+    logger.info(f"Weather history missing {len(missing_ranges)} ranges")
+    for start_d, end_d in missing_ranges:
+        fetched = fetch_historical_weather(start_d, end_d)
+        history.update(fetched)
+
+    save_weather_history(history)
+    logger.info("Weather history updated.")
+
+
+def schedule_daily_weather_update():
+    """Schedule daily weather history update in a background thread."""
+
+    def _update_and_reschedule():
+        try:
+            update_weather_history_if_needed()
+        except Exception as e:
+            logger.error(f"Error updating weather history: {e}")
+        finally:
+            # schedule next run
+            threading.Timer(WEATHER_UPDATE_INTERVAL_SECONDS, _update_and_reschedule).start()
+
+    # first run shortly after startup
+    threading.Timer(60, _update_and_reschedule).start()
+
+
+# ---------- WEATHER FORECAST ----------
+
+def fetch_weather_forecast(days: int):
+    """
+    Fetch daily mean temperature forecast for Arnfels using Open-Meteo.
+    Returns list[(date, avg_temp_c)] for up to `days`.
+
+    Open-Meteo supports up to 16 forecast days. For >16, we will extend later.
+    """
+    if days <= 0:
+        return []
+
+    base_days = min(days, 16)
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": WEATHER_LAT,
+        "longitude": WEATHER_LON,
+        "daily": "temperature_2m_mean",
+        "forecast_days": base_days,
+        "timezone": "auto",
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        times = data.get("daily", {}).get("time", [])
+        temps = data.get("daily", {}).get("temperature_2m_mean", [])
+        result = []
+        for t_str, temp in zip(times, temps):
+            try:
+                d = datetime.strptime(t_str, "%Y-%m-%d").date()
+                result.append((d, float(temp)))
+            except Exception:
+                continue
+
+        # If we want more than 16 days, extend using average of available
+        if days > base_days:
+            if result:
+                avg_temp = sum(t for _, t in result) / len(result)
+                last_date = result[-1][0]
+            else:
+                avg_temp = 5.0  # arbitrary fallback
+                last_date = date.today()
+            for _ in range(days - base_days):
+                last_date = last_date + timedelta(days=1)
+                result.append((last_date, avg_temp))
+
+        return result[:days]
+    except Exception as e:
+        logger.warning(f"Failed to fetch forecast: {e}")
+        return []
+
+
+def build_kwh_forecast_from_temps(temp_list, model, tariffs_by_year, grid_powers_sorted):
+    """
+    Use HDD model to turn a list of (date, avg_temp_c) into
+    daily kWh and cost predictions.
+
+    Returns:
+      total_kwh, total_cost, avg_kwh_per_day, avg_cost_per_day, per_day_list
+      where per_day_list is list of dicts with keys:
+      {date, kwh, cost}
+    """
+    if not model or not temp_list:
+        return None, None, None, None, []
+
+    base_load = model["base_load"]
+    alpha = model["alpha"]
+
+    total_kwh = 0.0
+    total_cost = 0.0
+    per_day = []
+
+    for d, temp in temp_list:
+        hdd = max(0.0, HDD_BASE_TEMP_C - temp)
+        kwh = max(0.0, base_load + alpha * hdd)
+
+        year = d.year
+        tariff = tariffs_by_year.get(year)
+        cost = None
+        if tariff:
+            days_in_year = 366 if calendar.isleap(year) else 365
+            power_kw = get_power_kw_for_date(d, grid_powers_sorted, tariffs_by_year)
+            yearly_fixed = (tariff["base_price_per_kw"] * power_kw
+                            + tariff["additional_yearly_costs"])
+            fixed_per_day = yearly_fixed / days_in_year
+            energy_cost_per_day = kwh * tariff["working_price_per_kwh"]
+            cost = fixed_per_day + energy_cost_per_day
+        else:
+            cost = None
+
+        per_day.append({"date": d, "kwh": kwh, "cost": cost})
+
+        total_kwh += kwh
+        if cost is not None:
+            total_cost += cost
+
+    days = len(temp_list)
+    avg_kwh = total_kwh / days if days > 0 else None
+    avg_cost = total_cost / days if (days > 0 and total_cost > 0) else None
+
+    return total_kwh, total_cost, avg_kwh, avg_cost, per_day
+
+
 # ---------- VIRTUAL READINGS (apply offsets) ----------
 
 def compute_virtual_readings(readings, offsets):
@@ -227,17 +486,25 @@ def get_power_kw_for_date(dt, grid_powers_sorted, tariffs_by_year):
     return power_kw
 
 
-# ---------- STATS & COSTS WITH PROPER YEAR/MONTH SPLITTING ----------
+# ---------- STATS & COSTS WITH PROPER YEAR/MONTH SPLITTING + WEATHER/HDD ----------
 
-def compute_stats(readings, tariffs_by_year, offsets, grid_powers):
+def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_history):
     """
     readings: physical meter readings
     offsets: list of offset events (for meter replacement)
     grid_powers: list of grid power changes (kW connected to grid)
+    weather_history: dict[date -> avg_temp_c]
 
     We work interval-based between readings, but for yearly/monthly stats
     we *split* each interval across calendar months. This avoids
     >365 days in any year and keeps totals consistent.
+
+    Additionally:
+      - Build a per-day list from intervals.
+      - Fit an HDD model kWh/day = base_load + alpha * HDD.
+      - Use weather forecast (7 and 30 days) to build predictions.
+      - Derive a heating-season forecast series (current season, next 30 days)
+        to overlay as a dotted line in the chart.
     """
     virtual_readings = compute_virtual_readings(readings, offsets)
     today = date.today()
@@ -256,8 +523,15 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers):
         "current_month_avg_kwh_per_day": None,
         "current_heating_season_avg_kwh_per_day": None,
         "last_heating_season_avg_kwh_per_day": None,
-        "heating_season_labels": [],
+        "heating_season_labels": ["Jun", "Jul", "Aug", "Sep", "Oct", "Nov",
+                                  "Dec", "Jan", "Feb", "Mar", "Apr", "May"],
         "heating_season_series": [],
+        "heating_season_forecast_series": [None] * 12,
+        "forecast_7d_total_kwh": None,
+        "forecast_7d_avg_kwh_per_day": None,
+        "forecast_30d_total_kwh": None,
+        "forecast_30d_avg_kwh_per_day": None,
+        "heating_model": None,
     }
 
     if len(virtual_readings) < 2:
@@ -312,6 +586,57 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers):
 
     if not daily_entries:
         return empty_result
+
+    # --- per-day list for HDD model ---
+    per_day_usage = []  # list of {date, kwh}
+    for e in daily_entries:
+        kwh_day = e["daily_kwh"]
+        d = e["start_date"]
+        while d < e["date"]:
+            per_day_usage.append({"date": d, "kwh": kwh_day})
+            d += timedelta(days=1)
+
+    # --- fit HDD model kWh/day = base_load + alpha * HDD ---
+    hdd_x = []
+    kwh_y = []
+
+    for pd in per_day_usage:
+        d = pd["date"]
+        kwh = pd["kwh"]
+        temp = weather_history.get(d)
+        if temp is None:
+            continue
+        hdd = max(0.0, HDD_BASE_TEMP_C - temp)
+        # use only heating days (HDD > 0)
+        if hdd <= 0:
+            continue
+        hdd_x.append(hdd)
+        kwh_y.append(kwh)
+
+    heating_model = None
+    if len(hdd_x) >= 10 and len(set(hdd_x)) > 1:
+        n = len(hdd_x)
+        x_mean = sum(hdd_x) / n
+        y_mean = sum(kwh_y) / n
+        num = sum((x - x_mean) * (y - y_mean) for x, y in zip(hdd_x, kwh_y))
+        den = sum((x - x_mean) ** 2 for x in hdd_x)
+        if den > 0:
+            alpha = num / den
+            base_load = y_mean - alpha * x_mean
+            heating_model = {
+                "base_load": base_load,
+                "alpha": alpha,
+                "n_days": n,
+                "hdd_base_temp": HDD_BASE_TEMP_C,
+            }
+            logger.info(
+                f"HDD model fitted: base_load={base_load:.2f} kWh/d, "
+                f"alpha={alpha:.2f} kWh/deg-day, days={n}"
+            )
+        else:
+            logger.info("HDD model: variance of HDD is zero, cannot fit.")
+    else:
+        logger.info("HDD model: not enough data to fit (need >=10 heating days).")
 
     # --- split intervals across months/years ---
 
@@ -448,7 +773,6 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers):
     for m in monthly_stats:
         y_m, mo_m = map(int, m["month"].split("-"))
         if (y_m, mo_m) < (current_year_int, current_month_int):
-            # monthly_stats is sorted ascending, so this will end up as the last one < current month
             last_before = m
     if last_before is not None:
         last_month_avg = last_before["avg_kwh_per_day"]
@@ -512,7 +836,67 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers):
         if sy >= 2024
     ]
 
-    return {
+    # ---------- Forecasts (7d & 30d) using HDD model + weather forecast ----------
+
+    forecast_7d_total_kwh = None
+    forecast_7d_avg_kwh = None
+    forecast_30d_total_kwh = None
+    forecast_30d_avg_kwh = None
+    heating_season_forecast_series = [None] * 12
+
+    if heating_model:
+        # 7-day forecast
+        temps_7 = fetch_weather_forecast(7)
+        t7_kwh, t7_cost, t7_avg_kwh, t7_avg_cost, per_day_7 = build_kwh_forecast_from_temps(
+            temps_7, heating_model, tariffs_by_year, grid_powers_sorted
+        )
+        forecast_7d_total_kwh = t7_kwh
+        forecast_7d_avg_kwh = t7_avg_kwh
+
+        # 30-day forecast
+        temps_30 = fetch_weather_forecast(30)
+        t30_kwh, t30_cost, t30_avg_kwh, t30_avg_cost, per_day_30 = build_kwh_forecast_from_temps(
+            temps_30, heating_model, tariffs_by_year, grid_powers_sorted
+        )
+        forecast_30d_total_kwh = t30_kwh
+        forecast_30d_avg_kwh = t30_avg_kwh
+
+        # Build heating-season forecast series for current season using next 30 days:
+        # For each forecast day that belongs to the current season, map to Jun..May index
+        if current_season_start is not None and per_day_30:
+            sums = [0.0] * 12
+            counts = [0] * 12
+
+            for pd in per_day_30:
+                d = pd["date"]
+                kwh = pd["kwh"]
+
+                # Determine season_start of this date
+                if d.month >= 6:
+                    season_start = d.year
+                else:
+                    season_start = d.year - 1
+
+                if season_start != current_season_start:
+                    continue
+
+                m = d.month
+                if m >= 6:
+                    idx = m - 6
+                else:
+                    idx = m + 6
+
+                if 0 <= idx < 12:
+                    sums[idx] += kwh
+                    counts[idx] += 1
+
+            for i in range(12):
+                if counts[i] > 0:
+                    heating_season_forecast_series[i] = sums[i] / counts[i]
+
+    # ---------- Assemble result ----------
+
+    stats = {
         "daily_entries": daily_entries,
         "all_time_avg_kwh_per_day": all_time_avg_kwh,
         "all_time_avg_cost_per_day": all_time_avg_cost,
@@ -527,7 +911,14 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers):
         "last_heating_season_avg_kwh_per_day": last_season_avg,
         "heating_season_labels": heating_season_labels,
         "heating_season_series": heating_season_series,
+        "heating_season_forecast_series": heating_season_forecast_series,
+        "forecast_7d_total_kwh": forecast_7d_total_kwh,
+        "forecast_7d_avg_kwh_per_day": forecast_7d_avg_kwh,
+        "forecast_30d_total_kwh": forecast_30d_total_kwh,
+        "forecast_30d_avg_kwh_per_day": forecast_30d_avg_kwh,
+        "heating_model": heating_model,
     }
+    return stats
 
 
 # ---------- ROUTES ----------
@@ -537,11 +928,19 @@ def index():
     """Dashboard / visualization only."""
     ensure_data_files()
 
+    # keep weather history up to date on index access as well
+    try:
+        update_weather_history_if_needed()
+    except Exception as e:
+        logger.error(f"Weather history update in index failed: {e}")
+
     readings = load_readings()
     tariffs = load_tariffs()
     offsets = load_offsets()
     grid_powers = load_grid_power()
-    stats = compute_stats(readings, tariffs, offsets, grid_powers)
+    weather_history = load_weather_history()
+
+    stats = compute_stats(readings, tariffs, offsets, grid_powers, weather_history)
 
     # For charts we still show one point per interval, with the end date as label
     daily_entries = stats["daily_entries"][-60:]
@@ -562,6 +961,7 @@ def index():
         daily_values=daily_values,
         monthly_labels=monthly_labels,
         monthly_values=monthly_values,
+        weather_city=WEATHER_CITY,
     )
 
 
@@ -653,5 +1053,14 @@ def tariffs():
 
 
 if __name__ == "__main__":
+    ensure_data_files()
+    # initial weather backfill at startup
+    try:
+        update_weather_history_if_needed()
+    except Exception as e:
+        logger.error(f"Initial weather history update failed: {e}")
+    # schedule daily background weather updates while container runs
+    schedule_daily_weather_update()
+
     # Docker-compatible
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=8080, debug=False)

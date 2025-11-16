@@ -29,6 +29,10 @@
         <div class="stat-label">Entries with usage</div>
         <div class="stat-value">{{ stats.daily_entries|length }}</div>
       </div>
+      <div class="stat">
+        <div class="stat-label">Location</div>
+        <div class="stat-value">{{ weather_city }}</div>
+      </div>
     </div>
 
     <div class="stat-row" style="margin-top:0.6rem;">
@@ -67,6 +71,94 @@
         <div class="stat-value">
           {% if stats.last_heating_season_avg_kwh_per_day %}
             {{ stats.last_heating_season_avg_kwh_per_day|round(2) }} kWh/day
+          {% else %}
+            –
+          {% endif %}
+        </div>
+      </div>
+    </div>
+
+    <hr style="border:none;border-top:1px solid #e5e7eb;margin:0.8rem 0;" />
+
+    <div class="stat-row">
+      <div class="stat">
+        <div class="stat-label">HDD base temp</div>
+        <div class="stat-value">
+          {% if stats.heating_model %}
+            {{ stats.heating_model.hdd_base_temp|round(1) }} °C
+          {% else %}
+            –
+          {% endif %}
+        </div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Base load (no heating)</div>
+        <div class="stat-value">
+          {% if stats.heating_model %}
+            {{ stats.heating_model.base_load|round(2) }} kWh/day
+          {% else %}
+            –
+          {% endif %}
+        </div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">α (per degree-day)</div>
+        <div class="stat-value">
+          {% if stats.heating_model %}
+            {{ stats.heating_model.alpha|round(2) }} kWh/deg-day
+          {% else %}
+            –
+          {% endif %}
+        </div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Model days</div>
+        <div class="stat-value">
+          {% if stats.heating_model %}
+            {{ stats.heating_model.n_days }}
+          {% else %}
+            –
+          {% endif %}
+        </div>
+      </div>
+    </div>
+
+    <div class="stat-row" style="margin-top:0.6rem;">
+      <div class="stat">
+        <div class="stat-label">Next 7 days (avg)</div>
+        <div class="stat-value">
+          {% if stats.forecast_7d_avg_kwh_per_day %}
+            {{ stats.forecast_7d_avg_kwh_per_day|round(2) }} kWh/day
+          {% else %}
+            –
+          {% endif %}
+        </div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Next 7 days (total)</div>
+        <div class="stat-value">
+          {% if stats.forecast_7d_total_kwh %}
+            {{ stats.forecast_7d_total_kwh|round(1) }} kWh
+          {% else %}
+            –
+          {% endif %}
+        </div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Next 30 days (avg)</div>
+        <div class="stat-value">
+          {% if stats.forecast_30d_avg_kwh_per_day %}
+            {{ stats.forecast_30d_avg_kwh_per_day|round(2) }} kWh/day
+          {% else %}
+            –
+          {% endif %}
+        </div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Next 30 days (total)</div>
+        <div class="stat-value">
+          {% if stats.forecast_30d_total_kwh %}
+            {{ stats.forecast_30d_total_kwh|round(1) }} kWh
           {% else %}
             –
           {% endif %}
@@ -250,7 +342,8 @@
       <canvas id="heatingSeasonChart"></canvas>
     </div>
     <p style="font-size:0.8rem;color:#6b7280;margin-top:0.4rem;">
-      Each line is a heating season (1 June – 31 May), aligned by month.
+      Solid lines: actual heating seasons (1 June – 31 May).  
+      Dotted line: model-based prediction for the current heating season (next 30 days).
     </p>
   {% else %}
     <p>No heating season data (from 1.6.2024) yet.</p>
@@ -358,6 +451,7 @@
   const hsCtx = document.getElementById('heatingSeasonChart').getContext('2d');
   const hsLabels = {{ stats.heating_season_labels|tojson }};
   const hsSeries = {{ stats.heating_season_series|tojson }};
+  const hsForecast = {{ stats.heating_season_forecast_series|tojson }};
   const hsColors = [
     '#2563eb', '#16a34a', '#f97316', '#dc2626',
     '#7c3aed', '#0d9488', '#ca8a04', '#4b5563'
@@ -372,6 +466,21 @@
     fill: false,
     spanGaps: true
   }));
+
+  // Add forecast dataset as dotted line if there's at least one non-null value
+  const hasForecast = hsForecast.some(v => v !== null && v !== undefined);
+  if (hasForecast) {
+    hsDatasets.push({
+      label: 'Forecast current season (next 30 days)',
+      data: hsForecast,
+      borderColor: '#111827',
+      backgroundColor: '#111827',
+      borderDash: [6, 4],
+      tension: 0.25,
+      fill: false,
+      spanGaps: true
+    });
+  }
 
   new Chart(hsCtx, {
     type: 'line',
