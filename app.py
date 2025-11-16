@@ -24,7 +24,7 @@ CSV_DATE_FORMAT = "%d.%m.%Y"  # e.g. 01.01.2022
 def parse_csv_date(s: str) -> date:
     """Parse a date from CSV (supports dd.mm.yyyy and yyyy-mm-dd)."""
     s = str(s).strip()
-    # if something like "01.01.2022;46286.0" slipped in, split off anything after ;
+    # handle things like "01.01.2022;46286.0"
     if ";" in s:
         s = s.split(";", 1)[0].strip()
     for fmt in (CSV_DATE_FORMAT, "%Y-%m-%d"):
@@ -89,6 +89,7 @@ def _load_two_column_date_float_csv(path, col1_name, col2_name):
             line = line.strip()
             if not line:
                 continue
+
             # Skip header if it contains the column name "date"
             if line_no == 0 and "date" in line.lower():
                 continue
@@ -135,7 +136,6 @@ def append_reading(date_str, meter_str):
 def load_tariffs():
     if not TARIFFS_CSV.exists():
         return {}
-    # Tariffs are written by the app itself, so normal CSV is fine
     df = pd.read_csv(TARIFFS_CSV)
     tariffs = {}
     for _, row in df.iterrows():
@@ -227,26 +227,46 @@ def get_power_kw_for_date(dt, grid_powers_sorted, tariffs_by_year):
     return power_kw
 
 
-# ---------- STATS & COSTS ----------
+# ---------- STATS & COSTS WITH PROPER YEAR/MONTH SPLITTING ----------
 
 def compute_stats(readings, tariffs_by_year, offsets, grid_powers):
     """
     readings: physical meter readings
     offsets: list of offset events (for meter replacement)
     grid_powers: list of grid power changes (kW connected to grid)
+
+    We work interval-based between readings, but for yearly/monthly stats
+    we *split* each interval across calendar months. This avoids
+    >365 days in any year and keeps totals consistent.
     """
     virtual_readings = compute_virtual_readings(readings, offsets)
+    today = date.today()
+    current_year = today.year
+
+    empty_result = {
+        "daily_entries": [],
+        "all_time_avg_kwh_per_day": None,
+        "all_time_avg_cost_per_day": None,
+        "monthly_stats": [],
+        "yearly_stats": [],
+        "current_year": current_year,
+        "current_year_months": [],
+        "month_comparisons": [],
+        "last_month_avg_kwh_per_day": None,
+        "current_month_avg_kwh_per_day": None,
+        "current_heating_season_avg_kwh_per_day": None,
+        "last_heating_season_avg_kwh_per_day": None,
+        "heating_season_labels": [],
+        "heating_season_series": [],
+    }
+
     if len(virtual_readings) < 2:
-        return {
-            "daily_entries": [],
-            "all_time_avg_kwh_per_day": None,
-            "all_time_avg_cost_per_day": None,
-            "monthly_stats": [],
-        }
+        return empty_result
 
     daily_entries = []
     grid_powers_sorted = sorted(grid_powers, key=lambda g: g["date"])
 
+    # --- per-interval entries (for charts) ---
     for prev, curr in zip(virtual_readings, virtual_readings[1:]):
         days = (curr["date"] - prev["date"]).days
         if days <= 0:
@@ -259,69 +279,254 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers):
             delta_kwh = curr["meter_reading"]
 
         daily_kwh = delta_kwh / days
-        year = curr["date"].year
+
+        start_date = prev["date"]
+        end_date = curr["date"]
+
+        # Tariff & cost based on start date's year
+        year = start_date.year
         tariff = tariffs_by_year.get(year)
         daily_cost = None
 
         if tariff:
             days_in_year = 366 if calendar.isleap(year) else 365
-
-            # Use the correct kW for that date
-            power_kw = get_power_kw_for_date(curr["date"], grid_powers_sorted, tariffs_by_year)
-
+            power_kw = get_power_kw_for_date(start_date, grid_powers_sorted, tariffs_by_year)
             yearly_fixed = (tariff["base_price_per_kw"] * power_kw
                             + tariff["additional_yearly_costs"])
             fixed_per_day = yearly_fixed / days_in_year
+            energy_cost_per_day = daily_kwh * tariff["working_price_per_kwh"]
+            daily_cost = fixed_per_day + energy_cost_per_day
 
-            energy_cost = daily_kwh * tariff["working_price_per_kwh"]
-            daily_cost = fixed_per_day + energy_cost
+        total_cost_interval = daily_cost * days if daily_cost is not None else None
 
         daily_entries.append({
-            "date": curr["date"],
+            # end date is still nice as label for graphs
+            "date": end_date,
+            "start_date": start_date,
+            "days": days,
+            "delta_kwh": delta_kwh,
             "daily_kwh": daily_kwh,
             "daily_cost": daily_cost,
+            "total_cost": total_cost_interval,
         })
 
     if not daily_entries:
-        return {
-            "daily_entries": [],
-            "all_time_avg_kwh_per_day": None,
-            "all_time_avg_cost_per_day": None,
-            "monthly_stats": [],
-        }
+        return empty_result
 
-    total_kwh = sum(e["daily_kwh"] for e in daily_entries)
-    all_time_avg_kwh = total_kwh / len(daily_entries)
+    # --- split intervals across months/years ---
 
-    cost_entries = [e["daily_cost"] for e in daily_entries if e["daily_cost"] is not None]
-    all_time_avg_cost = (sum(cost_entries) / len(cost_entries)) if cost_entries else None
-
+    yearly_groups = {}
     monthly_groups = {}
-    for e in daily_entries:
-        key = e["date"].strftime("%Y-%m")
-        if key not in monthly_groups:
-            monthly_groups[key] = {"total_kwh": 0.0, "total_cost": 0.0, "days": 0}
-        monthly_groups[key]["total_kwh"] += e["daily_kwh"]
-        monthly_groups[key]["days"] += 1
-        if e["daily_cost"] is not None:
-            monthly_groups[key]["total_cost"] += e["daily_cost"]
+    total_days = 0
+    total_kwh_all = 0.0
+    total_cost_all = 0.0
 
+    for e in daily_entries:
+        daily_kwh = e["daily_kwh"]
+        daily_cost = e["daily_cost"]
+        cursor = e["start_date"]
+        end = e["date"]
+
+        while cursor < end:
+            year = cursor.year
+            month = cursor.month
+
+            # first day of next month
+            if month == 12:
+                next_month_first = date(year + 1, 1, 1)
+            else:
+                next_month_first = date(year, month + 1, 1)
+
+            chunk_end = min(end, next_month_first)
+            days_chunk = (chunk_end - cursor).days
+            if days_chunk <= 0:
+                break
+
+            kwh_chunk = daily_kwh * days_chunk
+            cost_chunk = daily_cost * days_chunk if daily_cost is not None else None
+
+            # yearly
+            yg = yearly_groups.setdefault(year, {"total_kwh": 0.0, "total_cost": 0.0, "days": 0})
+            yg["total_kwh"] += kwh_chunk
+            yg["days"] += days_chunk
+            if cost_chunk is not None:
+                yg["total_cost"] += cost_chunk
+
+            # monthly
+            month_key = f"{year}-{month:02d}"
+            mg = monthly_groups.setdefault(month_key, {"total_kwh": 0.0, "total_cost": 0.0, "days": 0})
+            mg["total_kwh"] += kwh_chunk
+            mg["days"] += days_chunk
+            if cost_chunk is not None:
+                mg["total_cost"] += cost_chunk
+
+            # global totals
+            total_days += days_chunk
+            total_kwh_all += kwh_chunk
+            if cost_chunk is not None:
+                total_cost_all += cost_chunk
+
+            cursor = chunk_end
+
+    # --- all-time averages ---
+    all_time_avg_kwh = total_kwh_all / total_days if total_days > 0 else None
+    all_time_avg_cost = (total_cost_all / total_days) if (total_days > 0 and total_cost_all > 0) else None
+
+    # --- build monthly_stats list ---
     monthly_stats = []
     for month_key in sorted(monthly_groups.keys()):
-        group = monthly_groups[key := month_key]
-        avg_kwh = group["total_kwh"] / group["days"]
-        avg_cost = (group["total_cost"] / group["days"]) if group["total_cost"] else None
+        group = monthly_groups[month_key]
+        days_m = group["days"]
+        total_kwh_m = group["total_kwh"]
+        total_cost_m = group["total_cost"] if group["total_cost"] != 0 else None
+        avg_kwh_m = (total_kwh_m / days_m) if days_m > 0 else None
+        avg_cost_m = (total_cost_m / days_m) if (days_m > 0 and total_cost_m is not None) else None
         monthly_stats.append({
-            "month": month_key,
-            "avg_kwh_per_day": avg_kwh,
-            "avg_cost_per_day": avg_cost,
+            "month": month_key,          # "YYYY-MM"
+            "days": days_m,
+            "total_kwh": total_kwh_m,
+            "total_cost": total_cost_m,
+            "avg_kwh_per_day": avg_kwh_m,
+            "avg_cost_per_day": avg_cost_m,
         })
+
+    # --- build yearly_stats list ---
+    yearly_stats = []
+    for y in sorted(yearly_groups.keys()):
+        g = yearly_groups[y]
+        days_y = g["days"]
+        total_kwh_y = g["total_kwh"]
+        total_cost_y = g["total_cost"] if g["total_cost"] != 0 else None
+        avg_kwh_y = (total_kwh_y / days_y) if days_y > 0 else None
+        avg_cost_y = (total_cost_y / days_y) if (days_y > 0 and total_cost_y is not None) else None
+        yearly_stats.append({
+            "year": y,
+            "days": days_y,
+            "total_kwh": total_kwh_y,
+            "total_cost": total_cost_y,
+            "avg_kwh_per_day": avg_kwh_y,
+            "avg_cost_per_day": avg_cost_y,
+        })
+
+    # --- current year monthly detail ---
+    current_year_months = [
+        m for m in monthly_stats
+        if m["month"].startswith(f"{current_year}-")
+    ]
+
+    # --- month comparisons (same calendar month across years) ---
+    month_comparisons = []
+    for mnum in range(1, 13):
+        month_str = f"{mnum:02d}"
+        stats_for_month = [
+            m for m in monthly_stats if m["month"][5:7] == month_str
+        ]
+        if not stats_for_month:
+            continue
+        stats_for_month.sort(key=lambda m: m["month"])  # by year
+        month_comparisons.append({
+            "month_num": month_str,
+            "month_name": calendar.month_name[mnum],
+            "entries": stats_for_month,
+        })
+
+    # --- extra summary metrics ---
+
+    # Current month average (calendar month of today)
+    current_month_key = today.strftime("%Y-%m")
+    current_year_int, current_month_int = map(int, current_month_key.split("-"))
+
+    current_month_avg = None
+    for m in monthly_stats:
+        if m["month"] == current_month_key:
+            current_month_avg = m["avg_kwh_per_day"]
+            break
+
+    # Last month average = latest month *before* the current calendar month
+    last_month_avg = None
+    last_before = None
+    for m in monthly_stats:
+        y_m, mo_m = map(int, m["month"].split("-"))
+        if (y_m, mo_m) < (current_year_int, current_month_int):
+            # monthly_stats is sorted ascending, so this will end up as the last one < current month
+            last_before = m
+    if last_before is not None:
+        last_month_avg = last_before["avg_kwh_per_day"]
+
+    # Heating seasons (1.6. – 31.5.)
+    # season_start_year = year if month >= 6 else year - 1
+    season_groups = {}      # season_start_year -> {days, total_kwh, total_cost}
+    season_series_map = {}  # season_start_year -> chart series
+
+    for m in monthly_stats:
+        year_m, month_m = map(int, m["month"].split("-"))
+        if month_m >= 6:
+            season_start = year_m
+        else:
+            season_start = year_m - 1
+
+        # accumulate totals for season
+        sg = season_groups.setdefault(season_start, {"days": 0, "total_kwh": 0.0, "total_cost": 0.0})
+        sg["days"] += m["days"]
+        sg["total_kwh"] += m["total_kwh"]
+        if m["total_cost"] is not None:
+            sg["total_cost"] += m["total_cost"]
+
+        # series for chart (avg kWh/day per month in heating season)
+        series = season_series_map.setdefault(season_start, {
+            "label": f"{season_start}/{(season_start + 1) % 100:02d}",
+            "start_year": season_start,
+            "data": [None] * 12,  # Jun..May
+        })
+
+        # map month to index in 0..11 (Jun..May)
+        if month_m >= 6:
+            idx = month_m - 6  # 6->0 .. 12->6
+        else:
+            idx = month_m + 6  # 1->7 .. 5->11
+
+        series["data"][idx] = m["avg_kwh_per_day"]
+
+    # Current & last heating season average
+    if today.month >= 6:
+        current_season_start = today.year
+    else:
+        current_season_start = today.year - 1
+
+    last_season_start = current_season_start - 1
+
+    def season_avg(start_year):
+        sg = season_groups.get(start_year)
+        if not sg or sg["days"] <= 0:
+            return None
+        return sg["total_kwh"] / sg["days"]
+
+    current_season_avg = season_avg(current_season_start)
+    last_season_avg = season_avg(last_season_start)
+
+    # Heating season chart data (only from 1.6.2024 -> seasons starting 2024+)
+    heating_season_labels = ["Jun", "Jul", "Aug", "Sep", "Oct", "Nov",
+                             "Dec", "Jan", "Feb", "Mar", "Apr", "May"]
+    heating_season_series = [
+        series for sy, series in sorted(season_series_map.items())
+        if sy >= 2024
+    ]
 
     return {
         "daily_entries": daily_entries,
         "all_time_avg_kwh_per_day": all_time_avg_kwh,
         "all_time_avg_cost_per_day": all_time_avg_cost,
         "monthly_stats": monthly_stats,
+        "yearly_stats": yearly_stats,
+        "current_year": current_year,
+        "current_year_months": current_year_months,
+        "month_comparisons": month_comparisons,
+        "last_month_avg_kwh_per_day": last_month_avg,
+        "current_month_avg_kwh_per_day": current_month_avg,
+        "current_heating_season_avg_kwh_per_day": current_season_avg,
+        "last_heating_season_avg_kwh_per_day": last_season_avg,
+        "heating_season_labels": heating_season_labels,
+        "heating_season_series": heating_season_series,
     }
 
 
@@ -338,12 +543,16 @@ def index():
     grid_powers = load_grid_power()
     stats = compute_stats(readings, tariffs, offsets, grid_powers)
 
+    # For charts we still show one point per interval, with the end date as label
     daily_entries = stats["daily_entries"][-60:]
     daily_labels = [e["date"].isoformat() for e in daily_entries]
     daily_values = [round(e["daily_kwh"], 2) for e in daily_entries]
 
     monthly_labels = [m["month"] for m in stats["monthly_stats"]]
-    monthly_values = [round(m["avg_kwh_per_day"], 2) for m in stats["monthly_stats"]]
+    monthly_values = [
+        round(m["avg_kwh_per_day"], 2) if m["avg_kwh_per_day"] is not None else None
+        for m in stats["monthly_stats"]
+    ]
 
     return render_template(
         "index.html",
@@ -388,7 +597,7 @@ def input_view():
 
     return render_template(
         "input.html",
-        readings=readings[-10:],  # small helper table
+        readings=readings[-10:],
         offsets=offsets,
         grid_powers=grid_powers,
         today=date.today().isoformat(),
@@ -445,4 +654,4 @@ def tariffs():
 
 if __name__ == "__main__":
     # Docker-compatible
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=8080, debug=False)

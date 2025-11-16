@@ -30,6 +30,49 @@
         <div class="stat-value">{{ stats.daily_entries|length }}</div>
       </div>
     </div>
+
+    <div class="stat-row" style="margin-top:0.6rem;">
+      <div class="stat">
+        <div class="stat-label">Last month avg</div>
+        <div class="stat-value">
+          {% if stats.last_month_avg_kwh_per_day %}
+            {{ stats.last_month_avg_kwh_per_day|round(2) }} kWh/day
+          {% else %}
+            –
+          {% endif %}
+        </div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Current month avg</div>
+        <div class="stat-value">
+          {% if stats.current_month_avg_kwh_per_day %}
+            {{ stats.current_month_avg_kwh_per_day|round(2) }} kWh/day
+          {% else %}
+            –
+          {% endif %}
+        </div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Current heating season avg</div>
+        <div class="stat-value">
+          {% if stats.current_heating_season_avg_kwh_per_day %}
+            {{ stats.current_heating_season_avg_kwh_per_day|round(2) }} kWh/day
+          {% else %}
+            –
+          {% endif %}
+        </div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Last heating season avg</div>
+        <div class="stat-value">
+          {% if stats.last_heating_season_avg_kwh_per_day %}
+            {{ stats.last_heating_season_avg_kwh_per_day|round(2) }} kWh/day
+          {% else %}
+            –
+          {% endif %}
+        </div>
+      </div>
+    </div>
   </div>
 
   <div class="card">
@@ -61,6 +104,90 @@
 </div>
 
 <div class="card">
+  <h2>Yearly overview</h2>
+  {% if stats.yearly_stats %}
+    <table>
+      <thead>
+      <tr>
+        <th>Year</th>
+        <th>Total kWh</th>
+        <th>Avg kWh/day</th>
+        <th>Avg cost/day</th>
+        <th>Total cost</th>
+      </tr>
+      </thead>
+      <tbody>
+      {% for y in stats.yearly_stats %}
+        <tr>
+          <td>{{ y.year }}</td>
+          <td>{{ y.total_kwh|round(1) }}</td>
+          <td>
+            {% if y.avg_kwh_per_day is not none %}
+              {{ y.avg_kwh_per_day|round(2) }}
+            {% else %}–{% endif %}
+          </td>
+          <td>
+            {% if y.avg_cost_per_day is not none %}
+              {{ y.avg_cost_per_day|round(2) }} €
+            {% else %}–{% endif %}
+          </td>
+          <td>
+            {% if y.total_cost is not none %}
+              {{ y.total_cost|round(2) }} €
+            {% else %}–{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p>No yearly data yet.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Current year {{ stats.current_year }} – monthly breakdown</h2>
+  {% if stats.current_year_months %}
+    <table>
+      <thead>
+      <tr>
+        <th>Month</th>
+        <th>Avg kWh/day</th>
+        <th>Total kWh</th>
+        <th>Avg cost/day</th>
+        <th>Total cost</th>
+      </tr>
+      </thead>
+      <tbody>
+      {% for m in stats.current_year_months %}
+        <tr>
+          <td>{{ m.month }}</td>
+          <td>
+            {% if m.avg_kwh_per_day is not none %}
+              {{ m.avg_kwh_per_day|round(2) }}
+            {% else %}–{% endif %}
+          </td>
+          <td>{{ m.total_kwh|round(1) }}</td>
+          <td>
+            {% if m.avg_cost_per_day is not none %}
+              {{ m.avg_cost_per_day|round(2) }} €
+            {% else %}–{% endif %}
+          </td>
+          <td>
+            {% if m.total_cost is not none %}
+              {{ m.total_cost|round(2) }} €
+            {% else %}–{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p>No data for {{ stats.current_year }} yet.</p>
+  {% endif %}
+</div>
+
+<div class="card">
   <h2>Daily usage (kWh/day)</h2>
   {% if daily_labels %}
     <div class="chart-wrapper">
@@ -82,20 +209,30 @@
       <tr>
         <th>Month</th>
         <th>Avg kWh/day</th>
+        <th>Total kWh</th>
         <th>Avg cost/day</th>
+        <th>Total cost</th>
       </tr>
       </thead>
       <tbody>
       {% for m in stats.monthly_stats %}
         <tr>
           <td>{{ m.month }}</td>
-          <td>{{ m.avg_kwh_per_day|round(2) }}</td>
           <td>
-            {% if m.avg_cost_per_day %}
+            {% if m.avg_kwh_per_day is not none %}
+              {{ m.avg_kwh_per_day|round(2) }}
+            {% else %}–{% endif %}
+          </td>
+          <td>{{ m.total_kwh|round(1) }}</td>
+          <td>
+            {% if m.avg_cost_per_day is not none %}
               {{ m.avg_cost_per_day|round(2) }} €
-            {% else %}
-              –
-            {% endif %}
+            {% else %}–{% endif %}
+          </td>
+          <td>
+            {% if m.total_cost is not none %}
+              {{ m.total_cost|round(2) }} €
+            {% else %}–{% endif %}
           </td>
         </tr>
       {% endfor %}
@@ -103,6 +240,70 @@
     </table>
   {% else %}
     <p>No monthly data yet.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Heating seasons (from June)</h2>
+  {% if stats.heating_season_series %}
+    <div class="chart-wrapper">
+      <canvas id="heatingSeasonChart"></canvas>
+    </div>
+    <p style="font-size:0.8rem;color:#6b7280;margin-top:0.4rem;">
+      Each line is a heating season (1 June – 31 May), aligned by month.
+    </p>
+  {% else %}
+    <p>No heating season data (from 1.6.2024) yet.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Month comparison between years</h2>
+  {% if stats.month_comparisons %}
+    {% for group in stats.month_comparisons %}
+      <h3 style="font-size:0.95rem;margin-top:0.8rem;">
+        {{ group.month_name }} ({{ group.month_num }})
+      </h3>
+      <table style="margin-bottom:0.8rem;">
+        <thead>
+        <tr>
+          <th>Month</th>
+          <th>Avg kWh/day</th>
+          <th>Total kWh</th>
+          <th>Avg cost/day</th>
+          <th>Total cost</th>
+        </tr>
+        </thead>
+        <tbody>
+        {% for m in group.entries %}
+          <tr>
+            <td>{{ m.month }}</td> {# e.g. 2024-10, 2025-10 #}
+            <td>
+              {% if m.avg_kwh_per_day is not none %}
+                {{ m.avg_kwh_per_day|round(2) }}
+              {% else %}–{% endif %}
+            </td>
+            <td>{{ m.total_kwh|round(1) }}</td>
+            <td>
+              {% if m.avg_cost_per_day is not none %}
+                {{ m.avg_cost_per_day|round(2) }} €
+              {% else %}–{% endif %}
+            </td>
+            <td>
+              {% if m.total_cost is not none %}
+                {{ m.total_cost|round(2) }} €
+              {% else %}–{% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% endfor %}
+    <p style="font-size:0.8rem;color:#6b7280;">
+      Example: compare rows like 2024-10 vs 2025-10 to see changes between years.
+    </p>
+  {% else %}
+    <p>No month-comparison data yet.</p>
   {% endif %}
 </div>
 
@@ -148,6 +349,41 @@
       maintainAspectRatio: false,
       scales: {
         x: { ticks: { maxRotation: 60, minRotation: 30 } }
+      }
+    }
+  });
+  {% endif %}
+
+  {% if stats.heating_season_series %}
+  const hsCtx = document.getElementById('heatingSeasonChart').getContext('2d');
+  const hsLabels = {{ stats.heating_season_labels|tojson }};
+  const hsSeries = {{ stats.heating_season_series|tojson }};
+  const hsColors = [
+    '#2563eb', '#16a34a', '#f97316', '#dc2626',
+    '#7c3aed', '#0d9488', '#ca8a04', '#4b5563'
+  ];
+
+  const hsDatasets = hsSeries.map((s, idx) => ({
+    label: s.label,
+    data: s.data,
+    borderColor: hsColors[idx % hsColors.length],
+    backgroundColor: hsColors[idx % hsColors.length],
+    tension: 0.25,
+    fill: false,
+    spanGaps: true
+  }));
+
+  new Chart(hsCtx, {
+    type: 'line',
+    data: {
+      labels: hsLabels,
+      datasets: hsDatasets
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        x: { ticks: { maxRotation: 0, minRotation: 0 } }
       }
     }
   });
