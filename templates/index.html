@@ -336,17 +336,78 @@
 </div>
 
 <div class="card">
-  <h2>Heating seasons (from June)</h2>
+  <h2>Heating seasons – usage (from June)</h2>
   {% if stats.heating_season_series %}
     <div class="chart-wrapper">
       <canvas id="heatingSeasonChart"></canvas>
     </div>
     <p style="font-size:0.8rem;color:#6b7280;margin-top:0.4rem;">
       Solid lines: actual heating seasons (1 June – 31 May).  
-      Dotted line: model-based prediction for the current heating season (next 30 days).
+      Dotted line: model-based prediction for the <strong>next 30 days</strong> of the current heating season.
     </p>
   {% else %}
     <p>No heating season data (from 1.6.2024) yet.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Heating seasons – temperature history</h2>
+  {% if stats.temp_heating_season_series %}
+    <div class="chart-wrapper">
+      <canvas id="tempSeasonChart"></canvas>
+    </div>
+    <p style="font-size:0.8rem;color:#6b7280;margin-top:0.4rem;">
+      Average monthly outdoor temperature per heating season (1 June – 31 May).
+    </p>
+  {% else %}
+    <p>No temperature data yet (weather history not available or too short).</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Model vs actual per heating season</h2>
+  {% if stats.model_season_comparisons %}
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:0.75rem;">
+      {% for s in stats.model_season_comparisons %}
+        <div style="border:1px solid #e5e7eb;border-radius:0.75rem;padding:0.6rem 0.8rem;background:#f9fafb;">
+          <div style="font-weight:600;font-size:0.95rem;margin-bottom:0.25rem;">
+            Season {{ s.season_label }}
+          </div>
+          <div style="font-size:0.8rem;color:#6b7280;margin-bottom:0.3rem;">
+            Days modelled: {{ s.days }}
+          </div>
+
+          <!-- Mini line chart for this season (actual vs predicted per month) -->
+          <div style="height:140px;margin-bottom:0.4rem;">
+            <canvas id="seasonCompChart_{{ loop.index0 }}"></canvas>
+          </div>
+
+          <div style="font-size:0.85rem;">
+            <div>Actual total: <strong>{{ s.actual_total_kwh|round(0) }}</strong> kWh</div>
+            <div>Predicted total: <strong>{{ s.predicted_total_kwh|round(0) }}</strong> kWh</div>
+            <div>
+              Diff:
+              <strong>
+                {% if s.diff_kwh >= 0 %}+{% endif %}
+                {{ s.diff_kwh|round(0) }} kWh
+              </strong>
+            </div>
+            <div>
+              {% if s.diff_pct is not none %}
+                Error: <strong>{{ s.diff_pct|round(1) }} %</strong>
+              {% else %}
+                Error: –
+              {% endif %}
+            </div>
+          </div>
+          <div style="font-size:0.7rem;color:#9ca3af;margin-top:0.4rem;">
+            Note: model is fitted on all seasons (in-sample comparison).
+          </div>
+        </div>
+      {% endfor %}
+    </div>
+  {% else %}
+    <p>No comparison data yet (need weather & enough historical heating days).</p>
   {% endif %}
 </div>
 
@@ -495,6 +556,120 @@
         x: { ticks: { maxRotation: 0, minRotation: 0 } }
       }
     }
+  });
+  {% endif %}
+
+  {% if stats.temp_heating_season_series %}
+  const tempCtx = document.getElementById('tempSeasonChart').getContext('2d');
+  const tempLabels = {{ stats.heating_season_labels|tojson }};
+  const tempSeries = {{ stats.temp_heating_season_series|tojson }};
+  const tempColors = [
+    '#0ea5e9', '#22c55e', '#eab308', '#ef4444',
+    '#a855f7', '#14b8a6', '#f97316', '#64748b'
+  ];
+
+  const tempDatasets = tempSeries.map((s, idx) => ({
+    label: s.label,
+    data: s.data,
+    borderColor: tempColors[idx % tempColors.length],
+    backgroundColor: tempColors[idx % tempColors.length],
+    tension: 0.25,
+    fill: false,
+    spanGaps: true
+  }));
+
+  new Chart(tempCtx, {
+    type: 'line',
+    data: {
+      labels: tempLabels,
+      datasets: tempDatasets
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        x: { ticks: { maxRotation: 0, minRotation: 0 } },
+        y: {
+          title: {
+            display: true,
+            text: 'Average temperature (°C)'
+          }
+        }
+      }
+    }
+  });
+  {% endif %}
+
+  {% if stats.model_season_comparisons and stats.model_season_monthly_series %}
+  const modelComparisons = {{ stats.model_season_comparisons|tojson }};
+  const modelSeasonMonthly = {{ stats.model_season_monthly_series|tojson }};
+  const seasonLabels = {{ stats.heating_season_labels|tojson }};
+
+  modelComparisons.forEach((s, idx) => {
+    const monthly = modelSeasonMonthly[idx];
+    if (!monthly) return;
+
+    const canvasId = 'seasonCompChart_' + idx;
+    const el = document.getElementById(canvasId);
+    if (!el) return;
+
+    const ctx = el.getContext('2d');
+    new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: seasonLabels,
+        datasets: [
+          {
+            label: 'Actual avg kWh/day',
+            data: monthly.actual,
+            tension: 0.25,
+            fill: false
+          },
+          {
+            label: 'Predicted avg kWh/day',
+            data: monthly.predicted,
+            tension: 0.25,
+            fill: false,
+            borderDash: [5, 4]
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: {
+            display: true,
+            labels: { boxWidth: 10, font: { size: 9 } }
+          },
+          tooltip: {
+            callbacks: {
+              label: function(context) {
+                return context.dataset.label + ': ' +
+                       (context.raw === null ? '–' : context.raw.toFixed(1) + ' kWh/day');
+              }
+            }
+          }
+        },
+        scales: {
+          x: {
+            ticks: {
+              maxRotation: 0,
+              minRotation: 0,
+              font: { size: 9 }
+            }
+          },
+          y: {
+            ticks: {
+              font: { size: 9 },
+              callback: function(value) {
+                return value.toFixed ? value.toFixed(0) : value;
+              }
+            }
+          }
+        }
+      }
+    });
   });
   {% endif %}
 </script>

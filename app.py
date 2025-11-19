@@ -345,7 +345,8 @@ def fetch_weather_forecast(days: int):
     Fetch daily mean temperature forecast for Arnfels using Open-Meteo.
     Returns list[(date, avg_temp_c)] for up to `days`.
 
-    Open-Meteo supports up to 16 forecast days. For >16, we will extend later.
+    Open-Meteo supports up to 16 forecast days. For >16, we extend by
+    repeating the average temp of the available forecast.
     """
     if days <= 0:
         return []
@@ -486,25 +487,11 @@ def get_power_kw_for_date(dt, grid_powers_sorted, tariffs_by_year):
     return power_kw
 
 
-# ---------- STATS & COSTS WITH PROPER YEAR/MONTH SPLITTING + WEATHER/HDD ----------
+# ---------- STATS & COSTS + WEATHER/HDD ----------
 
 def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_history):
     """
-    readings: physical meter readings
-    offsets: list of offset events (for meter replacement)
-    grid_powers: list of grid power changes (kW connected to grid)
-    weather_history: dict[date -> avg_temp_c]
-
-    We work interval-based between readings, but for yearly/monthly stats
-    we *split* each interval across calendar months. This avoids
-    >365 days in any year and keeps totals consistent.
-
-    Additionally:
-      - Build a per-day list from intervals.
-      - Fit an HDD model kWh/day = base_load + alpha * HDD.
-      - Use weather forecast (7 and 30 days) to build predictions.
-      - Derive a heating-season forecast series (current season, next 30 days)
-        to overlay as a dotted line in the chart.
+    Main stats computation. See comments inside for details.
     """
     virtual_readings = compute_virtual_readings(readings, offsets)
     today = date.today()
@@ -532,6 +519,9 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
         "forecast_30d_total_kwh": None,
         "forecast_30d_avg_kwh_per_day": None,
         "heating_model": None,
+        "temp_heating_season_series": [],
+        "model_season_comparisons": [],
+        "model_season_monthly_series": [],
     }
 
     if len(virtual_readings) < 2:
@@ -587,7 +577,7 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
     if not daily_entries:
         return empty_result
 
-    # --- per-day list for HDD model ---
+    # --- per-day list for HDD model & for season comparison ---
     per_day_usage = []  # list of {date, kwh}
     for e in daily_entries:
         kwh_day = e["daily_kwh"]
@@ -723,7 +713,7 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
         total_kwh_y = g["total_kwh"]
         total_cost_y = g["total_cost"] if g["total_cost"] != 0 else None
         avg_kwh_y = (total_kwh_y / days_y) if days_y > 0 else None
-        avg_cost_y = (total_cost_y / days_y) if (days_y > 0 and total_cost_y is not None) else None
+        avg_cost_y = (total_cost_y / days_y) if (total_cost_y is not None and days_y > 0) else None
         yearly_stats.append({
             "year": y,
             "days": days_y,
@@ -845,7 +835,7 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
     heating_season_forecast_series = [None] * 12
 
     if heating_model:
-        # 7-day forecast
+        # 7-day forecast (for summary)
         temps_7 = fetch_weather_forecast(7)
         t7_kwh, t7_cost, t7_avg_kwh, t7_avg_cost, per_day_7 = build_kwh_forecast_from_temps(
             temps_7, heating_model, tariffs_by_year, grid_powers_sorted
@@ -853,7 +843,7 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
         forecast_7d_total_kwh = t7_kwh
         forecast_7d_avg_kwh = t7_avg_kwh
 
-        # 30-day forecast
+        # 30-day forecast (for summary + heating-season chart)
         temps_30 = fetch_weather_forecast(30)
         t30_kwh, t30_cost, t30_avg_kwh, t30_avg_cost, per_day_30 = build_kwh_forecast_from_temps(
             temps_30, heating_model, tariffs_by_year, grid_powers_sorted
@@ -861,8 +851,7 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
         forecast_30d_total_kwh = t30_kwh
         forecast_30d_avg_kwh = t30_avg_kwh
 
-        # Build heating-season forecast series for current season using next 30 days:
-        # For each forecast day that belongs to the current season, map to Jun..May index
+        # Map these 30 days into heating-season months for the current season only
         if current_season_start is not None and per_day_30:
             sums = [0.0] * 12
             counts = [0] * 12
@@ -871,28 +860,162 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
                 d = pd["date"]
                 kwh = pd["kwh"]
 
-                # Determine season_start of this date
+                # Determine heating season for this date
                 if d.month >= 6:
-                    season_start = d.year
+                    season_start_d = d.year
+                    idx = d.month - 6
                 else:
-                    season_start = d.year - 1
+                    season_start_d = d.year - 1
+                    idx = d.month + 6
 
-                if season_start != current_season_start:
+                # Only the current heating season
+                if season_start_d != current_season_start:
                     continue
 
-                m = d.month
-                if m >= 6:
-                    idx = m - 6
-                else:
-                    idx = m + 6
+                if not (0 <= idx < 12):
+                    continue
 
-                if 0 <= idx < 12:
-                    sums[idx] += kwh
-                    counts[idx] += 1
+                sums[idx] += kwh
+                counts[idx] += 1
 
             for i in range(12):
                 if counts[i] > 0:
                     heating_season_forecast_series[i] = sums[i] / counts[i]
+
+    # ---------- Temperature heating-season series ----------
+
+    temp_season_agg = {}
+    for d, temp in weather_history.items():
+        if d.month >= 6:
+            season_start = d.year
+            idx = d.month - 6
+        else:
+            season_start = d.year - 1
+            idx = d.month + 6
+
+        if not (0 <= idx < 12):
+            continue
+
+        agg = temp_season_agg.setdefault(season_start, {
+            "sum": [0.0] * 12,
+            "count": [0] * 12,
+        })
+        agg["sum"][idx] += temp
+        agg["count"][idx] += 1
+
+    temp_heating_season_series = []
+    for sy in sorted(temp_season_agg.keys()):
+        sums = temp_season_agg[sy]["sum"]
+        counts = temp_season_agg[sy]["count"]
+        data = []
+        for i in range(12):
+            if counts[i] > 0:
+                data.append(sums[i] / counts[i])
+            else:
+                data.append(None)
+        temp_heating_season_series.append({
+            "label": f"{sy}/{(sy + 1) % 100:02d}",
+            "start_year": sy,
+            "data": data,
+        })
+
+    # limit to recent seasons like usage chart
+    temp_heating_season_series = [
+        s for s in temp_heating_season_series if s["start_year"] >= 2024
+    ]
+
+    # ---------- Model vs actual comparison per heating season (season + monthly) ----------
+
+    model_season_comparisons = []
+    model_season_monthly_series = []
+
+    if heating_model:
+        base_load = heating_model["base_load"]
+        alpha = heating_model["alpha"]
+        comparison_agg = {}  # season_start -> {actual, predicted, days}
+        monthly_agg = {}     # season_start -> {actual_sum[12], pred_sum[12], days[12]}
+
+        for pd in per_day_usage:
+            d = pd["date"]
+            kwh_actual = pd["kwh"]
+            temp = weather_history.get(d)
+            if temp is None:
+                continue
+
+            hdd = max(0.0, HDD_BASE_TEMP_C - temp)
+            kwh_pred = max(0.0, base_load + alpha * hdd)
+
+            if d.month >= 6:
+                season_start = d.year
+                idx = d.month - 6
+            else:
+                season_start = d.year - 1
+                idx = d.month + 6
+
+            if not (0 <= idx < 12):
+                continue
+
+            # season totals
+            agg = comparison_agg.setdefault(season_start, {
+                "actual_total_kwh": 0.0,
+                "predicted_total_kwh": 0.0,
+                "days": 0,
+            })
+            agg["actual_total_kwh"] += kwh_actual
+            agg["predicted_total_kwh"] += kwh_pred
+            agg["days"] += 1
+
+            # monthly sums for this season
+            mdata = monthly_agg.setdefault(season_start, {
+                "actual_sum": [0.0] * 12,
+                "pred_sum": [0.0] * 12,
+                "days": [0] * 12,
+            })
+            mdata["actual_sum"][idx] += kwh_actual
+            mdata["pred_sum"][idx] += kwh_pred
+            mdata["days"][idx] += 1
+
+        for sy in sorted(comparison_agg.keys()):
+            agg = comparison_agg[sy]
+            if agg["days"] < 10:
+                continue
+
+            actual = agg["actual_total_kwh"]
+            predicted = agg["predicted_total_kwh"]
+            diff = predicted - actual
+            pct = (diff / actual * 100.0) if actual > 0 else None
+
+            model_season_comparisons.append({
+                "season_label": f"{sy}/{(sy + 1) % 100:02d}",
+                "season_start": sy,
+                "days": agg["days"],
+                "actual_total_kwh": actual,
+                "predicted_total_kwh": predicted,
+                "diff_kwh": diff,
+                "diff_pct": pct,
+            })
+
+            mdata = monthly_agg.get(sy)
+            if mdata:
+                monthly_actual = []
+                monthly_pred = []
+                for i in range(12):
+                    if mdata["days"][i] > 0:
+                        monthly_actual.append(mdata["actual_sum"][i] / mdata["days"][i])
+                        monthly_pred.append(mdata["pred_sum"][i] / mdata["days"][i])
+                    else:
+                        monthly_actual.append(None)
+                        monthly_pred.append(None)
+            else:
+                monthly_actual = [None] * 12
+                monthly_pred = [None] * 12
+
+            model_season_monthly_series.append({
+                "season_label": f"{sy}/{(sy + 1) % 100:02d}",
+                "season_start": sy,
+                "actual": monthly_actual,
+                "predicted": monthly_pred,
+            })
 
     # ---------- Assemble result ----------
 
@@ -917,6 +1040,9 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
         "forecast_30d_total_kwh": forecast_30d_total_kwh,
         "forecast_30d_avg_kwh_per_day": forecast_30d_avg_kwh,
         "heating_model": heating_model,
+        "temp_heating_season_series": temp_heating_season_series,
+        "model_season_comparisons": model_season_comparisons,
+        "model_season_monthly_series": model_season_monthly_series,
     }
     return stats
 
@@ -1063,4 +1189,4 @@ if __name__ == "__main__":
     schedule_daily_weather_update()
 
     # Docker-compatible
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=8080, debug=False)
