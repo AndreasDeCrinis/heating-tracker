@@ -32,6 +32,9 @@ WEATHER_LON = 15.4031
 HDD_BASE_TEMP_C = 18.0
 WEATHER_UPDATE_INTERVAL_SECONDS = 24 * 60 * 60  # once per day
 
+# Only use data for HDD model from this date onwards
+HDD_MODEL_START_DATE = date(2024, 9, 1)
+
 
 # ---------- DATE HELPERS ----------
 
@@ -85,10 +88,11 @@ def ensure_data_files():
             writer = csv.writer(f)
             writer.writerow(["date", "power_kw"])
 
+    # extended: avg, min, max
     if not WEATHER_CSV.exists():
         with WEATHER_CSV.open("w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["date", "avg_temp_c"])
+            writer.writerow(["date", "avg_temp_c", "min_temp_c", "max_temp_c"])
 
 
 # ---------- GENERIC SIMPLE CSV LOADERS (HANDLE ; OR ,) ----------
@@ -113,7 +117,6 @@ def _load_two_column_date_float_csv(path, col1_name, col2_name):
             if line_no == 0 and "date" in line.lower():
                 continue
 
-            # Decide separator per line
             sep = ";" if ";" in line else ","
             parts = line.split(sep)
             if len(parts) < 2:
@@ -126,7 +129,6 @@ def _load_two_column_date_float_csv(path, col1_name, col2_name):
                 dt = parse_csv_date(date_str)
                 val = float(value_str.replace(",", "."))
             except Exception:
-                # Skip lines we can't parse
                 continue
 
             rows.append({col1_name: dt, col2_name: val})
@@ -142,12 +144,21 @@ def load_readings():
 
 
 def append_reading(date_str, meter_str):
-    # date_str from HTML is yyyy-mm-dd
     dt = datetime.strptime(date_str, "%Y-%m-%d").date()
     meter = float(meter_str.replace(",", "."))
     with READINGS_CSV.open("a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([format_csv_date(dt), meter])
+
+
+def save_readings(readings_list):
+    """Overwrite readings.csv from a list of {'date', 'meter_reading'} dicts."""
+    readings_sorted = sorted(readings_list, key=lambda r: r["date"])
+    with READINGS_CSV.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["date", "meter_reading"])
+        for r in readings_sorted:
+            writer.writerow([format_csv_date(r["date"]), r["meter_reading"]])
 
 
 # ---------- TARIFFS ----------
@@ -202,38 +213,79 @@ def append_grid_power(date_str, power_str):
         writer.writerow([format_csv_date(dt), power_kw])
 
 
-# ---------- WEATHER HISTORY ----------
+# ---------- WEATHER HISTORY (avg + min + max) ----------
 
 def load_weather_history():
-    """Load weather.csv -> dict[date -> avg_temp_c]."""
+    """
+    Load weather.csv as dict[date -> {"avg": float, "min": float|None, "max": float|None}].
+
+    Supports old files that only had avg_temp_c.
+    """
     if not WEATHER_CSV.exists():
         return {}
+
     history = {}
     with WEATHER_CSV.open("r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+
+        has_min = "min_temp_c" in fieldnames
+        has_max = "max_temp_c" in fieldnames
+
         for row in reader:
             try:
                 d = datetime.strptime(row["date"], "%Y-%m-%d").date()
-                t = float(row["avg_temp_c"])
-                history[d] = t
+                avg = float(row["avg_temp_c"])
             except Exception:
                 continue
+
+            min_t = None
+            max_t = None
+            if has_min:
+                val = row.get("min_temp_c")
+                if val not in (None, ""):
+                    try:
+                        min_t = float(val)
+                    except Exception:
+                        pass
+            if has_max:
+                val = row.get("max_temp_c")
+                if val not in (None, ""):
+                    try:
+                        max_t = float(val)
+                    except Exception:
+                        pass
+
+            history[d] = {"avg": avg, "min": min_t, "max": max_t}
     return history
 
 
 def save_weather_history(history: dict):
+    """
+    Save weather history with 3 columns: avg, min, max.
+    """
     with WEATHER_CSV.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["date", "avg_temp_c"])
+        writer.writerow(["date", "avg_temp_c", "min_temp_c", "max_temp_c"])
         for d in sorted(history.keys()):
-            writer.writerow([d.isoformat(), history[d]])
+            info = history[d]
+            avg = info.get("avg")
+            min_t = info.get("min")
+            max_t = info.get("max")
+            writer.writerow([
+                d.isoformat(),
+                "" if avg is None else avg,
+                "" if min_t is None else min_t,
+                "" if max_t is None else max_t,
+            ])
 
 
 def fetch_historical_weather(start_date: date, end_date: date) -> dict:
     """
-    Fetch historical daily mean temperature from Open-Meteo
+    Fetch historical daily mean, min, max temperature from Open-Meteo
     for Arnfels between start_date and end_date (inclusive).
-    Returns dict[date -> avg_temp_c].
+
+    Returns dict[date -> {"avg": float, "min": float|None, "max": float|None}]
     """
     logger.info(f"Fetching historical weather {start_date}..{end_date} for {WEATHER_CITY}")
     url = "https://archive-api.open-meteo.com/v1/archive"
@@ -242,22 +294,41 @@ def fetch_historical_weather(start_date: date, end_date: date) -> dict:
         "longitude": WEATHER_LON,
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
-        "daily": "temperature_2m_mean",
+        "daily": "temperature_2m_mean,temperature_2m_min,temperature_2m_max",
         "timezone": "auto",
     }
     try:
         resp = requests.get(url, params=params, timeout=20)
         resp.raise_for_status()
         data = resp.json()
-        times = data.get("daily", {}).get("time", [])
-        temps = data.get("daily", {}).get("temperature_2m_mean", [])
+        daily = data.get("daily", {})
+        times = daily.get("time", [])
+        temps_mean = daily.get("temperature_2m_mean", [])
+        temps_min = daily.get("temperature_2m_min", [])
+        temps_max = daily.get("temperature_2m_max", [])
         result = {}
-        for t_str, temp in zip(times, temps):
+
+        for i, t_str in enumerate(times):
             try:
                 d = datetime.strptime(t_str, "%Y-%m-%d").date()
-                result[d] = float(temp)
             except Exception:
                 continue
+            try:
+                avg = float(temps_mean[i])
+            except Exception:
+                avg = None
+            try:
+                mn = float(temps_min[i])
+            except Exception:
+                mn = None
+            try:
+                mx = float(temps_max[i])
+            except Exception:
+                mx = None
+
+            if avg is not None:
+                result[d] = {"avg": avg, "min": mn, "max": mx}
+
         logger.info(f"Fetched {len(result)} historical days")
         return result
     except Exception as e:
@@ -266,7 +337,6 @@ def fetch_historical_weather(start_date: date, end_date: date) -> dict:
 
 
 def daterange(start: date, end: date):
-    """Yield dates from start to end (inclusive)."""
     cur = start
     while cur <= end:
         yield cur
@@ -275,7 +345,7 @@ def daterange(start: date, end: date):
 
 def update_weather_history_if_needed():
     """
-    Ensure weather.csv has daily average temperature for all dates
+    Ensure weather.csv has daily temperature data for all dates
     between the earliest reading date and today.
     """
     readings = load_readings()
@@ -331,22 +401,17 @@ def schedule_daily_weather_update():
         except Exception as e:
             logger.error(f"Error updating weather history: {e}")
         finally:
-            # schedule next run
             threading.Timer(WEATHER_UPDATE_INTERVAL_SECONDS, _update_and_reschedule).start()
 
-    # first run shortly after startup
     threading.Timer(60, _update_and_reschedule).start()
 
 
-# ---------- WEATHER FORECAST ----------
+# ---------- WEATHER FORECAST (mean only; used for HDD prediction) ----------
 
 def fetch_weather_forecast(days: int):
     """
     Fetch daily mean temperature forecast for Arnfels using Open-Meteo.
     Returns list[(date, avg_temp_c)] for up to `days`.
-
-    Open-Meteo supports up to 16 forecast days. For >16, we extend by
-    repeating the average temp of the available forecast.
     """
     if days <= 0:
         return []
@@ -364,8 +429,9 @@ def fetch_weather_forecast(days: int):
         resp = requests.get(url, params=params, timeout=15)
         resp.raise_for_status()
         data = resp.json()
-        times = data.get("daily", {}).get("time", [])
-        temps = data.get("daily", {}).get("temperature_2m_mean", [])
+        daily = data.get("daily", {})
+        times = daily.get("time", [])
+        temps = daily.get("temperature_2m_mean", [])
         result = []
         for t_str, temp in zip(times, temps):
             try:
@@ -374,13 +440,12 @@ def fetch_weather_forecast(days: int):
             except Exception:
                 continue
 
-        # If we want more than 16 days, extend using average of available
         if days > base_days:
             if result:
                 avg_temp = sum(t for _, t in result) / len(result)
                 last_date = result[-1][0]
             else:
-                avg_temp = 5.0  # arbitrary fallback
+                avg_temp = 5.0
                 last_date = date.today()
             for _ in range(days - base_days):
                 last_date = last_date + timedelta(days=1)
@@ -399,8 +464,6 @@ def build_kwh_forecast_from_temps(temp_list, model, tariffs_by_year, grid_powers
 
     Returns:
       total_kwh, total_cost, avg_kwh_per_day, avg_cost_per_day, per_day_list
-      where per_day_list is list of dicts with keys:
-      {date, kwh, cost}
     """
     if not model or not temp_list:
         return None, None, None, None, []
@@ -427,11 +490,8 @@ def build_kwh_forecast_from_temps(temp_list, model, tariffs_by_year, grid_powers
             fixed_per_day = yearly_fixed / days_in_year
             energy_cost_per_day = kwh * tariff["working_price_per_kwh"]
             cost = fixed_per_day + energy_cost_per_day
-        else:
-            cost = None
 
         per_day.append({"date": d, "kwh": kwh, "cost": cost})
-
         total_kwh += kwh
         if cost is not None:
             total_cost += cost
@@ -491,7 +551,7 @@ def get_power_kw_for_date(dt, grid_powers_sorted, tariffs_by_year):
 
 def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_history):
     """
-    Main stats computation. See comments inside for details.
+    Main stats computation.
     """
     virtual_readings = compute_virtual_readings(readings, offsets)
     today = date.today()
@@ -516,8 +576,8 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
         "heating_season_forecast_series": [None] * 12,
         "forecast_7d_total_kwh": None,
         "forecast_7d_avg_kwh_per_day": None,
-        "forecast_30d_total_kwh": None,
-        "forecast_30d_avg_kwh_per_day": None,
+        "forecast_current_month_total_kwh": None,
+        "forecast_current_month_avg_kwh_per_day": None,
         "heating_model": None,
         "temp_heating_season_series": [],
         "model_season_comparisons": [],
@@ -537,9 +597,8 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
             continue
 
         delta_kwh = curr["virtual_meter"] - prev["virtual_meter"]
-
-        # Safety: if still negative, assume meter reset and use physical reading as delta
         if delta_kwh < 0:
+            # meter rolled over or reset without offset
             delta_kwh = curr["meter_reading"]
 
         daily_kwh = delta_kwh / days
@@ -547,7 +606,6 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
         start_date = prev["date"]
         end_date = curr["date"]
 
-        # Tariff & cost based on start date's year
         year = start_date.year
         tariff = tariffs_by_year.get(year)
         daily_cost = None
@@ -564,7 +622,6 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
         total_cost_interval = daily_cost * days if daily_cost is not None else None
 
         daily_entries.append({
-            # end date is still nice as label for graphs
             "date": end_date,
             "start_date": start_date,
             "days": days,
@@ -577,8 +634,8 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
     if not daily_entries:
         return empty_result
 
-    # --- per-day list for HDD model & for season comparison ---
-    per_day_usage = []  # list of {date, kwh}
+    # --- per-day list for HDD model & season comparison ---
+    per_day_usage = []
     for e in daily_entries:
         kwh_day = e["daily_kwh"]
         d = e["start_date"]
@@ -586,18 +643,23 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
             per_day_usage.append({"date": d, "kwh": kwh_day})
             d += timedelta(days=1)
 
-    # --- fit HDD model kWh/day = base_load + alpha * HDD ---
+    # --- fit HDD model: kWh/day = base_load + alpha * HDD ---
     hdd_x = []
     kwh_y = []
 
     for pd in per_day_usage:
         d = pd["date"]
+        # Only use data from HDD_MODEL_START_DATE onwards for training
+        if d < HDD_MODEL_START_DATE:
+            continue
         kwh = pd["kwh"]
-        temp = weather_history.get(d)
+        info = weather_history.get(d)
+        if not info:
+            continue
+        temp = info.get("avg")
         if temp is None:
             continue
         hdd = max(0.0, HDD_BASE_TEMP_C - temp)
-        # use only heating days (HDD > 0)
         if hdd <= 0:
             continue
         hdd_x.append(hdd)
@@ -618,15 +680,16 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
                 "alpha": alpha,
                 "n_days": n,
                 "hdd_base_temp": HDD_BASE_TEMP_C,
+                "model_start": HDD_MODEL_START_DATE,
             }
             logger.info(
-                f"HDD model fitted: base_load={base_load:.2f} kWh/d, "
-                f"alpha={alpha:.2f} kWh/deg-day, days={n}"
+                f"HDD model fitted (from {HDD_MODEL_START_DATE}): "
+                f"base_load={base_load:.2f} kWh/d, alpha={alpha:.2f} kWh/deg-day, days={n}"
             )
         else:
             logger.info("HDD model: variance of HDD is zero, cannot fit.")
     else:
-        logger.info("HDD model: not enough data to fit (need >=10 heating days).")
+        logger.info("HDD model: not enough recent data to fit (need >=10 heating days).")
 
     # --- split intervals across months/years ---
 
@@ -646,7 +709,6 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
             year = cursor.year
             month = cursor.month
 
-            # first day of next month
             if month == 12:
                 next_month_first = date(year + 1, 1, 1)
             else:
@@ -660,14 +722,12 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
             kwh_chunk = daily_kwh * days_chunk
             cost_chunk = daily_cost * days_chunk if daily_cost is not None else None
 
-            # yearly
             yg = yearly_groups.setdefault(year, {"total_kwh": 0.0, "total_cost": 0.0, "days": 0})
             yg["total_kwh"] += kwh_chunk
             yg["days"] += days_chunk
             if cost_chunk is not None:
                 yg["total_cost"] += cost_chunk
 
-            # monthly
             month_key = f"{year}-{month:02d}"
             mg = monthly_groups.setdefault(month_key, {"total_kwh": 0.0, "total_cost": 0.0, "days": 0})
             mg["total_kwh"] += kwh_chunk
@@ -675,7 +735,6 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
             if cost_chunk is not None:
                 mg["total_cost"] += cost_chunk
 
-            # global totals
             total_days += days_chunk
             total_kwh_all += kwh_chunk
             if cost_chunk is not None:
@@ -683,11 +742,10 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
 
             cursor = chunk_end
 
-    # --- all-time averages ---
     all_time_avg_kwh = total_kwh_all / total_days if total_days > 0 else None
     all_time_avg_cost = (total_cost_all / total_days) if (total_days > 0 and total_cost_all > 0) else None
 
-    # --- build monthly_stats list ---
+    # --- monthly_stats ---
     monthly_stats = []
     for month_key in sorted(monthly_groups.keys()):
         group = monthly_groups[month_key]
@@ -697,7 +755,7 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
         avg_kwh_m = (total_kwh_m / days_m) if days_m > 0 else None
         avg_cost_m = (total_cost_m / days_m) if (days_m > 0 and total_cost_m is not None) else None
         monthly_stats.append({
-            "month": month_key,          # "YYYY-MM"
+            "month": month_key,
             "days": days_m,
             "total_kwh": total_kwh_m,
             "total_cost": total_cost_m,
@@ -705,7 +763,7 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
             "avg_cost_per_day": avg_cost_m,
         })
 
-    # --- build yearly_stats list ---
+    # --- yearly_stats ---
     yearly_stats = []
     for y in sorted(yearly_groups.keys()):
         g = yearly_groups[y]
@@ -716,7 +774,7 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
         avg_cost_y = (total_cost_y / days_y) if (total_cost_y is not None and days_y > 0) else None
         yearly_stats.append({
             "year": y,
-            "days": days_y,
+            "days": g["days"],
             "total_kwh": total_kwh_y,
             "total_cost": total_cost_y,
             "avg_kwh_per_day": avg_kwh_y,
@@ -724,30 +782,23 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
         })
 
     # --- current year monthly detail ---
-    current_year_months = [
-        m for m in monthly_stats
-        if m["month"].startswith(f"{current_year}-")
-    ]
+    current_year_months = [m for m in monthly_stats if m["month"].startswith(f"{current_year}-")]
 
     # --- month comparisons (same calendar month across years) ---
     month_comparisons = []
     for mnum in range(1, 13):
         month_str = f"{mnum:02d}"
-        stats_for_month = [
-            m for m in monthly_stats if m["month"][5:7] == month_str
-        ]
+        stats_for_month = [m for m in monthly_stats if m["month"][5:7] == month_str]
         if not stats_for_month:
             continue
-        stats_for_month.sort(key=lambda m: m["month"])  # by year
+        stats_for_month.sort(key=lambda m: m["month"])
         month_comparisons.append({
             "month_num": month_str,
             "month_name": calendar.month_name[mnum],
             "entries": stats_for_month,
         })
 
-    # --- extra summary metrics ---
-
-    # Current month average (calendar month of today)
+    # --- extra summary metrics: current & last month ---
     current_month_key = today.strftime("%Y-%m")
     current_year_int, current_month_int = map(int, current_month_key.split("-"))
 
@@ -757,7 +808,6 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
             current_month_avg = m["avg_kwh_per_day"]
             break
 
-    # Last month average = latest month *before* the current calendar month
     last_month_avg = None
     last_before = None
     for m in monthly_stats:
@@ -767,10 +817,9 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
     if last_before is not None:
         last_month_avg = last_before["avg_kwh_per_day"]
 
-    # Heating seasons (1.6. – 31.5.)
-    # season_start_year = year if month >= 6 else year - 1
-    season_groups = {}      # season_start_year -> {days, total_kwh, total_cost}
-    season_series_map = {}  # season_start_year -> chart series
+    # --- heating seasons (1.6.–31.5.) ---
+    season_groups = {}
+    season_series_map = {}
 
     for m in monthly_stats:
         year_m, month_m = map(int, m["month"].split("-"))
@@ -779,34 +828,29 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
         else:
             season_start = year_m - 1
 
-        # accumulate totals for season
         sg = season_groups.setdefault(season_start, {"days": 0, "total_kwh": 0.0, "total_cost": 0.0})
         sg["days"] += m["days"]
         sg["total_kwh"] += m["total_kwh"]
         if m["total_cost"] is not None:
             sg["total_cost"] += m["total_cost"]
 
-        # series for chart (avg kWh/day per month in heating season)
         series = season_series_map.setdefault(season_start, {
             "label": f"{season_start}/{(season_start + 1) % 100:02d}",
             "start_year": season_start,
-            "data": [None] * 12,  # Jun..May
+            "data": [None] * 12,
         })
 
-        # map month to index in 0..11 (Jun..May)
         if month_m >= 6:
-            idx = month_m - 6  # 6->0 .. 12->6
+            idx = month_m - 6
         else:
-            idx = month_m + 6  # 1->7 .. 5->11
+            idx = month_m + 6
 
         series["data"][idx] = m["avg_kwh_per_day"]
 
-    # Current & last heating season average
     if today.month >= 6:
         current_season_start = today.year
     else:
         current_season_start = today.year - 1
-
     last_season_start = current_season_start - 1
 
     def season_avg(start_year):
@@ -818,7 +862,6 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
     current_season_avg = season_avg(current_season_start)
     last_season_avg = season_avg(last_season_start)
 
-    # Heating season chart data (only from 1.6.2024 -> seasons starting 2024+)
     heating_season_labels = ["Jun", "Jul", "Aug", "Sep", "Oct", "Nov",
                              "Dec", "Jan", "Feb", "Mar", "Apr", "May"]
     heating_season_series = [
@@ -826,16 +869,16 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
         if sy >= 2024
     ]
 
-    # ---------- Forecasts (7d & 30d) using HDD model + weather forecast ----------
+    # ---------- Forecasts ----------
 
     forecast_7d_total_kwh = None
     forecast_7d_avg_kwh = None
-    forecast_30d_total_kwh = None
-    forecast_30d_avg_kwh = None
+    forecast_current_month_total_kwh = None
+    forecast_current_month_avg_kwh = None
     heating_season_forecast_series = [None] * 12
 
     if heating_model:
-        # 7-day forecast (for summary)
+        # --- 7-day rolling forecast ---
         temps_7 = fetch_weather_forecast(7)
         t7_kwh, t7_cost, t7_avg_kwh, t7_avg_cost, per_day_7 = build_kwh_forecast_from_temps(
             temps_7, heating_model, tariffs_by_year, grid_powers_sorted
@@ -843,49 +886,60 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
         forecast_7d_total_kwh = t7_kwh
         forecast_7d_avg_kwh = t7_avg_kwh
 
-        # 30-day forecast (for summary + heating-season chart)
-        temps_30 = fetch_weather_forecast(30)
-        t30_kwh, t30_cost, t30_avg_kwh, t30_avg_cost, per_day_30 = build_kwh_forecast_from_temps(
-            temps_30, heating_model, tariffs_by_year, grid_powers_sorted
-        )
-        forecast_30d_total_kwh = t30_kwh
-        forecast_30d_avg_kwh = t30_avg_kwh
+        # --- current month forecast (calendar month) ---
+        first_of_month = date(today.year, today.month, 1)
+        if today.month == 12:
+            next_month_first = date(today.year + 1, 1, 1)
+        else:
+            next_month_first = date(today.year, today.month + 1, 1)
+        last_of_month = next_month_first - timedelta(days=1)
 
-        # Map these 30 days into heating-season months for the current season only
-        if current_season_start is not None and per_day_30:
-            sums = [0.0] * 12
-            counts = [0] * 12
+        days_for_forecast = (last_of_month - today).days + 1 if last_of_month >= today else 0
+        forecast_temps = fetch_weather_forecast(days_for_forecast) if days_for_forecast > 0 else []
+        forecast_temp_map = {d: t for d, t in forecast_temps}
 
-            for pd in per_day_30:
-                d = pd["date"]
-                kwh = pd["kwh"]
+        temps_month = []
+        cur = first_of_month
+        while cur <= last_of_month:
+            if cur <= today:
+                info = weather_history.get(cur)
+                if info and info.get("avg") is not None:
+                    temps_month.append((cur, info["avg"]))
+            else:
+                t = forecast_temp_map.get(cur)
+                if t is not None:
+                    temps_month.append((cur, t))
+            cur += timedelta(days=1)
 
-                # Determine heating season for this date
-                if d.month >= 6:
-                    season_start_d = d.year
-                    idx = d.month - 6
-                else:
-                    season_start_d = d.year - 1
-                    idx = d.month + 6
+        tmonth_kwh, tmonth_cost, tmonth_avg_kwh, tmonth_avg_cost, per_day_month = \
+            build_kwh_forecast_from_temps(temps_month, heating_model, tariffs_by_year, grid_powers_sorted)
 
-                # Only the current heating season
-                if season_start_d != current_season_start:
-                    continue
+        forecast_current_month_total_kwh = tmonth_kwh
+        forecast_current_month_avg_kwh = tmonth_avg_kwh
 
-                if not (0 <= idx < 12):
-                    continue
+        # Map this month's forecasted kWh/day into heating-season chart (one point)
+        if per_day_month:
+            if today.month >= 6:
+                season_start_this_month = today.year
+                idx = today.month - 6
+            else:
+                season_start_this_month = today.year - 1
+                idx = today.month + 6
 
-                sums[idx] += kwh
-                counts[idx] += 1
+            if season_start_this_month == current_season_start and 0 <= idx < 12:
+                month_days = len(per_day_month)
+                if month_days > 0:
+                    avg_month_kwh = tmonth_kwh / month_days
+                    heating_season_forecast_series[idx] = avg_month_kwh
 
-            for i in range(12):
-                if counts[i] > 0:
-                    heating_season_forecast_series[i] = sums[i] / counts[i]
-
-    # ---------- Temperature heating-season series ----------
+    # ---------- Temperature heating-season series (avg only) ----------
 
     temp_season_agg = {}
-    for d, temp in weather_history.items():
+    for d, info in weather_history.items():
+        avg = info.get("avg")
+        if avg is None:
+            continue
+
         if d.month >= 6:
             season_start = d.year
             idx = d.month - 6
@@ -900,13 +954,14 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
             "sum": [0.0] * 12,
             "count": [0] * 12,
         })
-        agg["sum"][idx] += temp
+        agg["sum"][idx] += avg
         agg["count"][idx] += 1
 
     temp_heating_season_series = []
     for sy in sorted(temp_season_agg.keys()):
-        sums = temp_season_agg[sy]["sum"]
-        counts = temp_season_agg[sy]["count"]
+        agg = temp_season_agg[sy]
+        sums = agg["sum"]
+        counts = agg["count"]
         data = []
         for i in range(12):
             if counts[i] > 0:
@@ -919,12 +974,11 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
             "data": data,
         })
 
-    # limit to recent seasons like usage chart
     temp_heating_season_series = [
         s for s in temp_heating_season_series if s["start_year"] >= 2024
     ]
 
-    # ---------- Model vs actual comparison per heating season (season + monthly) ----------
+    # ---------- Model vs actual comparison per heating season ----------
 
     model_season_comparisons = []
     model_season_monthly_series = []
@@ -932,13 +986,16 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
     if heating_model:
         base_load = heating_model["base_load"]
         alpha = heating_model["alpha"]
-        comparison_agg = {}  # season_start -> {actual, predicted, days}
-        monthly_agg = {}     # season_start -> {actual_sum[12], pred_sum[12], days[12]}
+        comparison_agg = {}
+        monthly_agg = {}
 
         for pd in per_day_usage:
             d = pd["date"]
             kwh_actual = pd["kwh"]
-            temp = weather_history.get(d)
+            info = weather_history.get(d)
+            if not info:
+                continue
+            temp = info.get("avg")
             if temp is None:
                 continue
 
@@ -955,7 +1012,6 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
             if not (0 <= idx < 12):
                 continue
 
-            # season totals
             agg = comparison_agg.setdefault(season_start, {
                 "actual_total_kwh": 0.0,
                 "predicted_total_kwh": 0.0,
@@ -965,7 +1021,6 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
             agg["predicted_total_kwh"] += kwh_pred
             agg["days"] += 1
 
-            # monthly sums for this season
             mdata = monthly_agg.setdefault(season_start, {
                 "actual_sum": [0.0] * 12,
                 "pred_sum": [0.0] * 12,
@@ -1017,8 +1072,6 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
                 "predicted": monthly_pred,
             })
 
-    # ---------- Assemble result ----------
-
     stats = {
         "daily_entries": daily_entries,
         "all_time_avg_kwh_per_day": all_time_avg_kwh,
@@ -1037,8 +1090,8 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
         "heating_season_forecast_series": heating_season_forecast_series,
         "forecast_7d_total_kwh": forecast_7d_total_kwh,
         "forecast_7d_avg_kwh_per_day": forecast_7d_avg_kwh,
-        "forecast_30d_total_kwh": forecast_30d_total_kwh,
-        "forecast_30d_avg_kwh_per_day": forecast_30d_avg_kwh,
+        "forecast_current_month_total_kwh": forecast_current_month_total_kwh,
+        "forecast_current_month_avg_kwh_per_day": forecast_current_month_avg_kwh,
         "heating_model": heating_model,
         "temp_heating_season_series": temp_heating_season_series,
         "model_season_comparisons": model_season_comparisons,
@@ -1051,10 +1104,9 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
 
 @app.route("/")
 def index():
-    """Dashboard / visualization only."""
+    """Dashboard / visualization."""
     ensure_data_files()
 
-    # keep weather history up to date on index access as well
     try:
         update_weather_history_if_needed()
     except Exception as e:
@@ -1068,7 +1120,6 @@ def index():
 
     stats = compute_stats(readings, tariffs, offsets, grid_powers, weather_history)
 
-    # For charts we still show one point per interval, with the end date as label
     daily_entries = stats["daily_entries"][-60:]
     daily_labels = [e["date"].isoformat() for e in daily_entries]
     daily_values = [round(e["daily_kwh"], 2) for e in daily_entries]
@@ -1178,15 +1229,59 @@ def tariffs():
     )
 
 
+@app.route("/readings", methods=["GET", "POST"])
+def readings_view():
+    """
+    List and edit all meter readings.
+    """
+    ensure_data_files()
+
+    if request.method == "POST":
+        action = request.form.get("action")
+        readings = load_readings()
+
+        try:
+            idx = int(request.form.get("index", "-1"))
+        except ValueError:
+            idx = -1
+
+        if 0 <= idx < len(readings):
+            if action == "update":
+                date_str = request.form.get("date")
+                meter_str = request.form.get("meter_reading", "").replace(",", ".")
+                try:
+                    new_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+                    new_meter = float(meter_str)
+                    readings[idx]["date"] = new_date
+                    readings[idx]["meter_reading"] = new_meter
+                    save_readings(readings)
+                    flash("Reading updated.", "success")
+                except Exception as e:
+                    flash(f"Could not update reading: {e}", "danger")
+            elif action == "delete":
+                try:
+                    del readings[idx]
+                    save_readings(readings)
+                    flash("Reading deleted.", "info")
+                except Exception as e:
+                    flash(f"Could not delete reading: {e}", "danger")
+        else:
+            flash("Invalid reading index.", "danger")
+
+        return redirect(url_for("readings_view"))
+
+    readings = load_readings()
+    return render_template(
+        "readings.html",
+        readings=readings,
+    )
+
+
 if __name__ == "__main__":
     ensure_data_files()
-    # initial weather backfill at startup
     try:
         update_weather_history_if_needed()
     except Exception as e:
         logger.error(f"Initial weather history update failed: {e}")
-    # schedule daily background weather updates while container runs
     schedule_daily_weather_update()
-
-    # Docker-compatible
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=8080, debug=False)

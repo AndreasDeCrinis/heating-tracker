@@ -47,7 +47,7 @@
         </div>
       </div>
       <div class="stat">
-        <div class="stat-label">Current month avg</div>
+        <div class="stat-label">Current month avg (actual)</div>
         <div class="stat-value">
           {% if stats.current_month_avg_kwh_per_day %}
             {{ stats.current_month_avg_kwh_per_day|round(2) }} kWh/day
@@ -112,7 +112,7 @@
         </div>
       </div>
       <div class="stat">
-        <div class="stat-label">Model days</div>
+        <div class="stat-label">Model days (since 01.09.2024)</div>
         <div class="stat-value">
           {% if stats.heating_model %}
             {{ stats.heating_model.n_days }}
@@ -145,20 +145,20 @@
         </div>
       </div>
       <div class="stat">
-        <div class="stat-label">Next 30 days (avg)</div>
+        <div class="stat-label">Current month forecast (avg)</div>
         <div class="stat-value">
-          {% if stats.forecast_30d_avg_kwh_per_day %}
-            {{ stats.forecast_30d_avg_kwh_per_day|round(2) }} kWh/day
+          {% if stats.forecast_current_month_avg_kwh_per_day %}
+            {{ stats.forecast_current_month_avg_kwh_per_day|round(2) }} kWh/day
           {% else %}
             –
           {% endif %}
         </div>
       </div>
       <div class="stat">
-        <div class="stat-label">Next 30 days (total)</div>
+        <div class="stat-label">Current month forecast (total)</div>
         <div class="stat-value">
-          {% if stats.forecast_30d_total_kwh %}
-            {{ stats.forecast_30d_total_kwh|round(1) }} kWh
+          {% if stats.forecast_current_month_total_kwh %}
+            {{ stats.forecast_current_month_total_kwh|round(1) }} kWh
           {% else %}
             –
           {% endif %}
@@ -343,7 +343,8 @@
     </div>
     <p style="font-size:0.8rem;color:#6b7280;margin-top:0.4rem;">
       Solid lines: actual heating seasons (1 June – 31 May).  
-      Dotted line: model-based prediction for the <strong>next 30 days</strong> of the current heating season.
+      Dotted point/line: model-based forecast for the <strong>current calendar month</strong>
+      (using historical temps so far and weather forecast for the rest of the month).
     </p>
   {% else %}
     <p>No heating season data (from 1.6.2024) yet.</p>
@@ -377,7 +378,6 @@
             Days modelled: {{ s.days }}
           </div>
 
-          <!-- Mini line chart for this season (actual vs predicted per month) -->
           <div style="height:140px;margin-bottom:0.4rem;">
             <canvas id="seasonCompChart_{{ loop.index0 }}"></canvas>
           </div>
@@ -401,7 +401,7 @@
             </div>
           </div>
           <div style="font-size:0.7rem;color:#9ca3af;margin-top:0.4rem;">
-            Note: model is fitted on all seasons (in-sample comparison).
+            Note: model is fitted from 01.09.2024 onwards (in-sample comparison).
           </div>
         </div>
       {% endfor %}
@@ -431,7 +431,7 @@
         <tbody>
         {% for m in group.entries %}
           <tr>
-            <td>{{ m.month }}</td> {# e.g. 2024-10, 2025-10 #}
+            <td>{{ m.month }}</td>
             <td>
               {% if m.avg_kwh_per_day is not none %}
                 {{ m.avg_kwh_per_day|round(2) }}
@@ -454,7 +454,7 @@
       </table>
     {% endfor %}
     <p style="font-size:0.8rem;color:#6b7280;">
-      Example: compare rows like 2024-10 vs 2025-10 to see changes between years.
+      Example: compare rows like 2024-11 vs 2025-11 to see changes between years.
     </p>
   {% else %}
     <p>No month-comparison data yet.</p>
@@ -479,9 +479,7 @@
       responsive: true,
       maintainAspectRatio: false,
       scales: {
-        x: {
-          ticks: { maxRotation: 60, minRotation: 30 }
-        }
+        x: { ticks: { maxRotation: 60, minRotation: 30 } }
       }
     }
   });
@@ -528,11 +526,10 @@
     spanGaps: true
   }));
 
-  // Add forecast dataset as dotted line if there's at least one non-null value
   const hasForecast = hsForecast.some(v => v !== null && v !== undefined);
   if (hasForecast) {
     hsDatasets.push({
-      label: 'Forecast current season (next 30 days)',
+      label: 'Forecast current month (model + weather)',
       data: hsForecast,
       borderColor: '#111827',
       backgroundColor: '#111827',
@@ -587,12 +584,24 @@
     options: {
       responsive: true,
       maintainAspectRatio: false,
+      plugins: {
+        legend: {
+          labels: { boxWidth: 10, font: { size: 9 } }
+        }
+      },
       scales: {
-        x: { ticks: { maxRotation: 0, minRotation: 0 } },
+        x: {
+          ticks: { maxRotation: 0, minRotation: 0 }
+        },
         y: {
           title: {
             display: true,
             text: 'Average temperature (°C)'
+          },
+          ticks: {
+            callback: function(value) {
+              return value.toFixed ? value.toFixed(0) + ' °C' : value + ' °C';
+            }
           }
         }
       }
