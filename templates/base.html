@@ -4,6 +4,14 @@
   <meta charset="utf-8">
   <title>Heating tracker</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#b91c1c">
+  <meta name="apple-mobile-web-app-title" content="Heating">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="mobile-web-app-capable" content="yes">
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='logo.svg') }}">
+  <link rel="apple-touch-icon" sizes="180x180" href="{{ url_for('static', filename='apple-touch-icon.png') }}">
+  <link rel="manifest" href="{{ url_for('static', filename='site.webmanifest') }}">
 
   <!-- Simple styling -->
   <style>
@@ -38,6 +46,17 @@
       margin: 0;
       font-size: 1.2rem;
       font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 0.55rem;
+    }
+
+    .app-logo {
+      width: 2rem;
+      height: 2rem;
+      border-radius: 0.55rem;
+      box-shadow: 0 6px 16px rgba(0, 0, 0, 0.22);
+      flex: 0 0 auto;
     }
 
     nav a {
@@ -197,7 +216,10 @@
 </head>
 <body>
 <header>
-  <h1>Heating tracker</h1>
+  <h1>
+    <img class="app-logo" src="{{ url_for('static', filename='logo.svg') }}" alt="" aria-hidden="true">
+    <span>Heating tracker</span>
+  </h1>
   <nav>
     <a href="{{ url_for('index') }}">Dashboard</a>
     <a href="{{ url_for('input_view') }}">Input</a>

@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Heating Tracker Logo</title>
+  <desc id="desc">A warm app icon with a radiator, heat wave, and rising usage line.</desc>
+  <defs>
+    <linearGradient id="bg" x1="76" y1="50" x2="436" y2="462" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffedd5"/>
+      <stop offset="0.48" stop-color="#fb923c"/>
+      <stop offset="1" stop-color="#b91c1c"/>
+    </linearGradient>
+    <linearGradient id="heat" x1="164" y1="127" x2="347" y2="281" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fff7ed"/>
+      <stop offset="1" stop-color="#fed7aa"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#7f1d1d" flood-opacity="0.28"/>
+    </filter>
+  </defs>
+  <rect width="512" height="512" fill="url(#bg)"/>
+  <path d="M132 311c37-44 62-65 93-65 39 0 49 39 88 39 27 0 47-19 67-48" fill="none" stroke="#7f1d1d" stroke-width="24" stroke-linecap="round" stroke-linejoin="round" opacity="0.28"/>
+  <g filter="url(#shadow)">
+    <rect x="118" y="246" width="276" height="133" rx="34" fill="#fff7ed"/>
+    <rect x="149" y="277" width="38" height="72" rx="18" fill="#fb923c"/>
+    <rect x="207" y="277" width="38" height="72" rx="18" fill="#fb923c"/>
+    <rect x="265" y="277" width="38" height="72" rx="18" fill="#fb923c"/>
+    <rect x="323" y="277" width="38" height="72" rx="18" fill="#fb923c"/>
+    <path d="M141 379h35M336 379h35" stroke="#fff7ed" stroke-width="24" stroke-linecap="round"/>
+  </g>
+  <path d="M181 198c-20-28 22-42 3-72M256 198c-22-31 28-48 5-86M331 198c-18-26 20-39 4-67" fill="none" stroke="url(#heat)" stroke-width="24" stroke-linecap="round"/>
+  <path d="M137 334c36-34 60-48 91-48 40 0 52 33 88 33 27 0 47-16 68-39" fill="none" stroke="#991b1b" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
