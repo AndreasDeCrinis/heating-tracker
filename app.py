@@ -2,7 +2,7 @@ import csv
 import calendar
 import logging
 from pathlib import Path
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 import threading
 
 import requests
@@ -22,6 +22,7 @@ TARIFFS_CSV = DATA_DIR / "tariffs.csv"
 OFFSETS_CSV = DATA_DIR / "offsets.csv"
 GRID_POWER_CSV = DATA_DIR / "grid_power.csv"
 WEATHER_CSV = DATA_DIR / "weather.csv"
+FORECAST_CSV = DATA_DIR / "forecast.csv"
 
 CSV_DATE_FORMAT = "%d.%m.%Y"  # e.g. 01.01.2022
 
@@ -31,12 +32,17 @@ WEATHER_LAT = 46.6764
 WEATHER_LON = 15.4031
 HDD_BASE_TEMP_C = 18.0
 WEATHER_UPDATE_INTERVAL_SECONDS = 24 * 60 * 60  # once per day
+FORECAST_CACHE_DAYS = 35
+FORECAST_CACHE_MAX_AGE_SECONDS = 6 * 60 * 60
+FORECAST_UPDATE_INTERVAL_SECONDS = FORECAST_CACHE_MAX_AGE_SECONDS
 
 # Only use data for HDD model from this date onwards
 HDD_MODEL_START_DATE = date(2024, 9, 1)
 
 _weather_update_lock = threading.Lock()
 _weather_update_thread = None
+_forecast_update_lock = threading.Lock()
+_forecast_update_thread = None
 
 
 # ---------- DATE HELPERS ----------
@@ -96,6 +102,11 @@ def ensure_data_files():
         with WEATHER_CSV.open("w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["date", "avg_temp_c", "min_temp_c", "max_temp_c"])
+
+    if not FORECAST_CSV.exists():
+        with FORECAST_CSV.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["fetched_at", "date", "avg_temp_c"])
 
 
 # ---------- GENERIC SIMPLE CSV LOADERS (HANDLE ; OR ,) ----------
@@ -489,6 +500,131 @@ def fetch_weather_forecast(days: int):
         return []
 
 
+def _utcnow():
+    return datetime.now(timezone.utc)
+
+
+def load_weather_forecast_cache():
+    """
+    Load cached forecast data.
+
+    Returns (forecast_temps, fetched_at), where forecast_temps is a sorted
+    list of (date, avg_temp_c) and fetched_at is a UTC datetime when present.
+    """
+    if not FORECAST_CSV.exists():
+        return [], None
+
+    forecasts = []
+    fetched_at = None
+    with FORECAST_CSV.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            fetched_raw = row.get("fetched_at")
+            if fetched_at is None and fetched_raw:
+                try:
+                    fetched_at = datetime.fromisoformat(fetched_raw)
+                    if fetched_at.tzinfo is None:
+                        fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+                    else:
+                        fetched_at = fetched_at.astimezone(timezone.utc)
+                except Exception:
+                    fetched_at = None
+
+            try:
+                forecast_date = datetime.strptime(row["date"], "%Y-%m-%d").date()
+                avg_temp = float(row["avg_temp_c"])
+            except Exception:
+                continue
+            forecasts.append((forecast_date, avg_temp))
+
+    forecasts.sort(key=lambda item: item[0])
+    return forecasts, fetched_at
+
+
+def save_weather_forecast_cache(forecast_temps):
+    """Save forecast data atomically so the dashboard can read it quickly."""
+    tmp_path = FORECAST_CSV.with_name(f"{FORECAST_CSV.name}.tmp")
+    fetched_at = _utcnow().isoformat()
+    with tmp_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["fetched_at", "date", "avg_temp_c"])
+        for forecast_date, avg_temp in sorted(forecast_temps, key=lambda item: item[0]):
+            writer.writerow([fetched_at, forecast_date.isoformat(), avg_temp])
+    tmp_path.replace(FORECAST_CSV)
+
+
+def is_weather_forecast_cache_fresh(forecast_temps, fetched_at):
+    if not forecast_temps or fetched_at is None:
+        return False
+
+    age = _utcnow() - fetched_at
+    if age > timedelta(seconds=FORECAST_CACHE_MAX_AGE_SECONDS):
+        return False
+
+    today = date.today()
+    latest_forecast_date = max(forecast_date for forecast_date, _ in forecast_temps)
+    return latest_forecast_date >= today + timedelta(days=6)
+
+
+def update_weather_forecast_if_needed(force=False):
+    """
+    Keep a cached forecast fresh without making dashboard requests wait on HTTP.
+    """
+    forecast_temps, fetched_at = load_weather_forecast_cache()
+    if not force and is_weather_forecast_cache_fresh(forecast_temps, fetched_at):
+        logger.info("Weather forecast cache up to date.")
+        return
+
+    fetched = fetch_weather_forecast(FORECAST_CACHE_DAYS)
+    if not fetched:
+        logger.info("Weather forecast cache not updated; no forecast data fetched.")
+        return
+
+    save_weather_forecast_cache(fetched)
+    logger.info(f"Weather forecast cache updated with {len(fetched)} days.")
+
+
+def _run_weather_forecast_update():
+    try:
+        update_weather_forecast_if_needed()
+    except Exception as e:
+        logger.error(f"Error updating weather forecast cache: {e}")
+
+
+def start_weather_forecast_update_async():
+    """Start a non-blocking forecast cache update if one is not already running."""
+    global _forecast_update_thread
+
+    with _forecast_update_lock:
+        if _forecast_update_thread and _forecast_update_thread.is_alive():
+            logger.info("Weather forecast update already running.")
+            return None
+
+        thread = threading.Thread(
+            target=_run_weather_forecast_update,
+            name="weather-forecast-update",
+            daemon=True,
+        )
+        _forecast_update_thread = thread
+        thread.start()
+        return thread
+
+
+def schedule_weather_forecast_update(initial_delay_seconds=FORECAST_UPDATE_INTERVAL_SECONDS):
+    """Schedule forecast cache refreshes without blocking the app."""
+
+    def _update_and_reschedule():
+        start_weather_forecast_update_async()
+        timer = threading.Timer(FORECAST_UPDATE_INTERVAL_SECONDS, _update_and_reschedule)
+        timer.daemon = True
+        timer.start()
+
+    timer = threading.Timer(initial_delay_seconds, _update_and_reschedule)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
 def build_kwh_forecast_from_temps(temp_list, model, tariffs_by_year, grid_powers_sorted):
     """
     Use HDD model to turn a list of (date, avg_temp_c) into
@@ -581,11 +717,12 @@ def get_power_kw_for_date(dt, grid_powers_sorted, tariffs_by_year):
 
 # ---------- STATS & COSTS + WEATHER/HDD ----------
 
-def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_history):
+def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_history, forecast_temps=None):
     """
     Main stats computation.
     """
     virtual_readings = compute_virtual_readings(readings, offsets)
+    forecast_temps = sorted(forecast_temps or [], key=lambda item: item[0])
     today = date.today()
     current_year = today.year
 
@@ -910,13 +1047,16 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
     heating_season_forecast_series = [None] * 12
 
     if heating_model:
+        cached_forecast_temps = [(d, t) for d, t in forecast_temps if d >= today]
+
         # --- 7-day rolling forecast ---
-        temps_7 = fetch_weather_forecast(7)
-        t7_kwh, t7_cost, t7_avg_kwh, t7_avg_cost, per_day_7 = build_kwh_forecast_from_temps(
-            temps_7, heating_model, tariffs_by_year, grid_powers_sorted
-        )
-        forecast_7d_total_kwh = t7_kwh
-        forecast_7d_avg_kwh = t7_avg_kwh
+        temps_7 = cached_forecast_temps[:7]
+        if len(temps_7) == 7:
+            t7_kwh, t7_cost, t7_avg_kwh, t7_avg_cost, per_day_7 = build_kwh_forecast_from_temps(
+                temps_7, heating_model, tariffs_by_year, grid_powers_sorted
+            )
+            forecast_7d_total_kwh = t7_kwh
+            forecast_7d_avg_kwh = t7_avg_kwh
 
         # --- current month forecast (calendar month) ---
         first_of_month = date(today.year, today.month, 1)
@@ -926,28 +1066,31 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
             next_month_first = date(today.year, today.month + 1, 1)
         last_of_month = next_month_first - timedelta(days=1)
 
-        days_for_forecast = (last_of_month - today).days + 1 if last_of_month >= today else 0
-        forecast_temps = fetch_weather_forecast(days_for_forecast) if days_for_forecast > 0 else []
-        forecast_temp_map = {d: t for d, t in forecast_temps}
+        forecast_temp_map = {d: t for d, t in cached_forecast_temps}
 
         temps_month = []
         cur = first_of_month
         while cur <= last_of_month:
+            forecast_temp = forecast_temp_map.get(cur)
             if cur <= today:
                 info = weather_history.get(cur)
                 if info and info.get("avg") is not None:
                     temps_month.append((cur, info["avg"]))
+                elif forecast_temp is not None:
+                    temps_month.append((cur, forecast_temp))
             else:
-                t = forecast_temp_map.get(cur)
-                if t is not None:
-                    temps_month.append((cur, t))
+                if forecast_temp is not None:
+                    temps_month.append((cur, forecast_temp))
             cur += timedelta(days=1)
 
-        tmonth_kwh, tmonth_cost, tmonth_avg_kwh, tmonth_avg_cost, per_day_month = \
-            build_kwh_forecast_from_temps(temps_month, heating_model, tariffs_by_year, grid_powers_sorted)
+        days_in_month = (last_of_month - first_of_month).days + 1
+        per_day_month = []
+        if len(temps_month) == days_in_month:
+            tmonth_kwh, tmonth_cost, tmonth_avg_kwh, tmonth_avg_cost, per_day_month = \
+                build_kwh_forecast_from_temps(temps_month, heating_model, tariffs_by_year, grid_powers_sorted)
 
-        forecast_current_month_total_kwh = tmonth_kwh
-        forecast_current_month_avg_kwh = tmonth_avg_kwh
+            forecast_current_month_total_kwh = tmonth_kwh
+            forecast_current_month_avg_kwh = tmonth_avg_kwh
 
         # Map this month's forecasted kWh/day into heating-season chart (one point)
         if per_day_month:
@@ -1139,14 +1282,16 @@ def index():
     """Dashboard / visualization."""
     ensure_data_files()
     start_weather_history_update_async()
+    start_weather_forecast_update_async()
 
     readings = load_readings()
     tariffs = load_tariffs()
     offsets = load_offsets()
     grid_powers = load_grid_power()
     weather_history = load_weather_history()
+    forecast_temps, _ = load_weather_forecast_cache()
 
-    stats = compute_stats(readings, tariffs, offsets, grid_powers, weather_history)
+    stats = compute_stats(readings, tariffs, offsets, grid_powers, weather_history, forecast_temps)
 
     daily_entries = stats["daily_entries"][-60:]
     daily_labels = [e["date"].isoformat() for e in daily_entries]
@@ -1308,5 +1453,7 @@ def readings_view():
 if __name__ == "__main__":
     ensure_data_files()
     start_weather_history_update_async()
+    start_weather_forecast_update_async()
     schedule_daily_weather_update()
+    schedule_weather_forecast_update()
     app.run(host="0.0.0.0", port=5000, debug=False)

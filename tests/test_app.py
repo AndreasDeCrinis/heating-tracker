@@ -1,5 +1,5 @@
 import threading
-from datetime import date as real_date
+from datetime import date as real_date, timedelta
 
 import app as heating_app
 
@@ -56,21 +56,55 @@ def test_weather_history_update_skips_duplicate_background_run(monkeypatch):
     assert calls == ["updated"]
 
 
+def test_weather_forecast_update_runs_in_background(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def fake_update():
+        calls.append("updated")
+        started.set()
+        release.wait(timeout=2)
+
+    monkeypatch.setattr(heating_app, "_forecast_update_thread", None)
+    monkeypatch.setattr(heating_app, "update_weather_forecast_if_needed", fake_update)
+
+    thread = heating_app.start_weather_forecast_update_async()
+
+    assert thread is not None
+    assert thread.daemon
+    assert started.wait(timeout=1)
+    assert thread.is_alive()
+
+    release.set()
+    thread.join(timeout=1)
+
+    assert calls == ["updated"]
+    assert not thread.is_alive()
+
+
 def test_index_starts_weather_sync_asynchronously(monkeypatch):
     started = []
 
     monkeypatch.setattr(heating_app, "ensure_data_files", lambda: None)
-    monkeypatch.setattr(heating_app, "start_weather_history_update_async", lambda: started.append(True))
+    monkeypatch.setattr(heating_app, "start_weather_history_update_async", lambda: started.append("history"))
+    monkeypatch.setattr(heating_app, "start_weather_forecast_update_async", lambda: started.append("forecast"))
     monkeypatch.setattr(
         heating_app,
         "update_weather_history_if_needed",
         lambda: (_ for _ in ()).throw(AssertionError("sync update should not run in index")),
+    )
+    monkeypatch.setattr(
+        heating_app,
+        "fetch_weather_forecast",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("forecast fetch should not run in index")),
     )
     monkeypatch.setattr(heating_app, "load_readings", lambda: [])
     monkeypatch.setattr(heating_app, "load_tariffs", lambda: {})
     monkeypatch.setattr(heating_app, "load_offsets", lambda: [])
     monkeypatch.setattr(heating_app, "load_grid_power", lambda: [])
     monkeypatch.setattr(heating_app, "load_weather_history", lambda: {})
+    monkeypatch.setattr(heating_app, "load_weather_forecast_cache", lambda: ([], None))
     monkeypatch.setattr(heating_app, "render_template", lambda *args, **kwargs: "ok")
 
     heating_app.app.config.update(TESTING=True)
@@ -79,7 +113,51 @@ def test_index_starts_weather_sync_asynchronously(monkeypatch):
 
     assert response.status_code == 200
     assert response.get_data(as_text=True) == "ok"
-    assert started == [True]
+    assert started == ["history", "forecast"]
+
+
+def test_compute_stats_uses_cached_forecast_without_network(monkeypatch):
+    class FixedDate(real_date):
+        @classmethod
+        def today(cls):
+            return cls(2024, 9, 12)
+
+    monkeypatch.setattr(heating_app, "date", FixedDate)
+    monkeypatch.setattr(
+        heating_app,
+        "fetch_weather_forecast",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("forecast fetch should not run in compute_stats")),
+    )
+
+    readings = []
+    meter = 100.0
+    for i in range(13):
+        readings.append({
+            "date": FixedDate(2024, 9, 1) + timedelta(days=i),
+            "meter_reading": meter,
+        })
+        meter += 10.0 + i
+
+    weather_history = {
+        FixedDate(2024, 9, 1) + timedelta(days=i): {"avg": 5.0 + (i % 5), "min": None, "max": None}
+        for i in range(12)
+    }
+    cached_forecast = [
+        (FixedDate.today() + timedelta(days=i), 6.0 + i)
+        for i in range(7)
+    ]
+
+    stats = heating_app.compute_stats(
+        readings,
+        tariffs_by_year={},
+        offsets=[],
+        grid_powers=[],
+        weather_history=weather_history,
+        forecast_temps=cached_forecast,
+    )
+
+    assert stats["heating_model"] is not None
+    assert stats["forecast_7d_avg_kwh_per_day"] is not None
 
 
 def test_weather_history_backfills_missing_days(tmp_path, monkeypatch):

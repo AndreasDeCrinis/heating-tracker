@@ -461,7 +461,12 @@
   {% endif %}
 </div>
 
+{% set has_charts = daily_labels or monthly_labels or stats.heating_season_series or stats.temp_heating_season_series or (stats.model_season_comparisons and stats.model_season_monthly_series) %}
+{% if has_charts %}
 <script>
+  function initDashboardCharts() {
+    if (typeof Chart === 'undefined') return;
+
   {% if daily_labels %}
   const dailyCtx = document.getElementById('dailyChart').getContext('2d');
   new Chart(dailyCtx, {
@@ -681,5 +686,24 @@
     });
   });
   {% endif %}
+  }
+
+  function loadDashboardChartLibrary() {
+    const chartScript = document.createElement('script');
+    chartScript.src = 'https://cdn.jsdelivr.net/npm/chart.js';
+    chartScript.async = true;
+    chartScript.onload = initDashboardCharts;
+    chartScript.onerror = function() {
+      console.warn('Chart.js could not be loaded.');
+    };
+    document.head.appendChild(chartScript);
+  }
+
+  if (document.readyState === 'complete') {
+    window.setTimeout(loadDashboardChartLibrary, 0);
+  } else {
+    window.addEventListener('load', loadDashboardChartLibrary, { once: true });
+  }
 </script>
+{% endif %}
 {% endblock %}
