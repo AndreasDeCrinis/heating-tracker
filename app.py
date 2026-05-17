@@ -35,6 +35,9 @@ WEATHER_UPDATE_INTERVAL_SECONDS = 24 * 60 * 60  # once per day
 # Only use data for HDD model from this date onwards
 HDD_MODEL_START_DATE = date(2024, 9, 1)
 
+_weather_update_lock = threading.Lock()
+_weather_update_thread = None
+
 
 # ---------- DATE HELPERS ----------
 
@@ -264,7 +267,8 @@ def save_weather_history(history: dict):
     """
     Save weather history with 3 columns: avg, min, max.
     """
-    with WEATHER_CSV.open("w", newline="", encoding="utf-8") as f:
+    tmp_path = WEATHER_CSV.with_name(f"{WEATHER_CSV.name}.tmp")
+    with tmp_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["date", "avg_temp_c", "min_temp_c", "max_temp_c"])
         for d in sorted(history.keys()):
@@ -278,6 +282,7 @@ def save_weather_history(history: dict):
                 "" if min_t is None else min_t,
                 "" if max_t is None else max_t,
             ])
+    tmp_path.replace(WEATHER_CSV)
 
 
 def fetch_historical_weather(start_date: date, end_date: date) -> dict:
@@ -392,18 +397,45 @@ def update_weather_history_if_needed():
     logger.info("Weather history updated.")
 
 
-def schedule_daily_weather_update():
-    """Schedule daily weather history update in a background thread."""
+def _run_weather_history_update():
+    try:
+        update_weather_history_if_needed()
+    except Exception as e:
+        logger.error(f"Error updating weather history: {e}")
+
+
+def start_weather_history_update_async():
+    """Start a non-blocking weather history update if one is not already running."""
+    global _weather_update_thread
+
+    with _weather_update_lock:
+        if _weather_update_thread and _weather_update_thread.is_alive():
+            logger.info("Weather history update already running.")
+            return None
+
+        thread = threading.Thread(
+            target=_run_weather_history_update,
+            name="weather-history-update",
+            daemon=True,
+        )
+        _weather_update_thread = thread
+        thread.start()
+        return thread
+
+
+def schedule_daily_weather_update(initial_delay_seconds=WEATHER_UPDATE_INTERVAL_SECONDS):
+    """Schedule daily weather history updates without blocking the app."""
 
     def _update_and_reschedule():
-        try:
-            update_weather_history_if_needed()
-        except Exception as e:
-            logger.error(f"Error updating weather history: {e}")
-        finally:
-            threading.Timer(WEATHER_UPDATE_INTERVAL_SECONDS, _update_and_reschedule).start()
+        start_weather_history_update_async()
+        timer = threading.Timer(WEATHER_UPDATE_INTERVAL_SECONDS, _update_and_reschedule)
+        timer.daemon = True
+        timer.start()
 
-    threading.Timer(60, _update_and_reschedule).start()
+    timer = threading.Timer(initial_delay_seconds, _update_and_reschedule)
+    timer.daemon = True
+    timer.start()
+    return timer
 
 
 # ---------- WEATHER FORECAST (mean only; used for HDD prediction) ----------
@@ -1106,11 +1138,7 @@ def compute_stats(readings, tariffs_by_year, offsets, grid_powers, weather_histo
 def index():
     """Dashboard / visualization."""
     ensure_data_files()
-
-    try:
-        update_weather_history_if_needed()
-    except Exception as e:
-        logger.error(f"Weather history update in index failed: {e}")
+    start_weather_history_update_async()
 
     readings = load_readings()
     tariffs = load_tariffs()
@@ -1279,9 +1307,6 @@ def readings_view():
 
 if __name__ == "__main__":
     ensure_data_files()
-    try:
-        update_weather_history_if_needed()
-    except Exception as e:
-        logger.error(f"Initial weather history update failed: {e}")
+    start_weather_history_update_async()
     schedule_daily_weather_update()
     app.run(host="0.0.0.0", port=5000, debug=False)
